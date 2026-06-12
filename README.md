@@ -1,52 +1,49 @@
 # apple-gpu-miner
 
-A SHA-256d miner for **Apple Silicon (M1 / M2 / M3 …) GPUs** via Metal,
-with a pure-Python Stratum v1 pool client and a `getblocktemplate` solo
-client. Works on any SHA-256d chain (Bitcoin, BTCC / Bitcoin-Classic, BCH,
-private testnets, …).
+苹果 Apple Silicon（M1 / M2 / M3 …）GPU 上跑的 SHA-256d 挖矿工具，
+基于 Metal 计算内核 + 纯 Python 标准库 Stratum v1 矿池客户端。
+适用于任意 SHA-256d 链（Bitcoin、BTCC / Bitcoin-Classic、BCH、私有测试链 …）。
 
-> 中文版： [README_zh.md](README_zh.md)
+> English version: [README_en.md](README_en.md)
 
-## Highlights
+## 亮点
 
-- **Metal compute kernel** (`src/metal_nonce_finder.mm`) — runtime-compiled
-  SHA-256d nonce search. ~180–250 MH/s on a base M2 (10-core GPU);
-  ~400–800 MH/s estimated on M2 Pro / Max.
-- **Stratum v1 pool client** (`src/stratum_miner.py`) — Python stdlib only
-  (no `pip install`), auto-reconnect with backoff, share verify before submit.
-- **GBT solo client** (`src/gbt_miner.py`) — same GPU helper, talks to any
-  Bitcoin Core-compatible RPC.
-- **Smoke test** (`tests/smoke_metal_nonce_finder.py`) — verifies the GPU
-  kernel is byte-for-byte identical to Python's `hashlib` SHA-256d.
+- **Metal 内核** (`src/metal_nonce_finder.mm`)：运行时编译的 SHA-256d nonce 搜索内核。
+  M2 (10 核 GPU) 实测 **~180–250 MH/s**；M2 Pro/Max 估计 ~400–800 MH/s。
+- **Stratum v1 矿池客户端** (`src/stratum_miner.py`)：只用 Python 标准库（**不需要 pip 装任何东西**），
+  自动重连、submit 前 CPU 复核。
+- **GBT solo 客户端** (`src/gbt_miner.py`)：同一份 GPU helper，对接任何 Bitcoin Core 兼容节点。
+- **冒烟测试** (`tests/smoke_metal_nonce_finder.py`)：验证 GPU 内核结果跟 Python `hashlib` 字节级一致。
 
-## Requirements
+## 系统要求
 
-- macOS 12+ (Apple Silicon recommended; Intel iGPUs work but are slow)
-- Xcode Command Line Tools: `xcode-select --install`
-- Python 3.9+ (stdlib only)
+- macOS 12+（推荐 Apple Silicon；Intel 核显也能跑但很慢）
+- Xcode Command Line Tools：`xcode-select --install`
+- Python 3.9+（只用标准库）
 
-## Quick start (pool, recommended)
+## 快速开始（连矿池，**推荐**）
 
 ```bash
-git clone https://github.com/<you>/apple-gpu-miner
+git clone https://github.com/<your-name>/apple-gpu-miner
 cd apple-gpu-miner
 
-# 1. Compile the Metal helper (a few seconds)
+# 1. 编译 Metal helper（几秒）
 ./scripts/build_metal.sh
 
-# 2. (Optional) Verify GPU == CPU
-python3 tests/smoke_metal_nonce_finder.py    # expect 4x [OK]
+# 2. 可选：跑一次冒烟测试，验证 GPU == CPU
+python3 tests/smoke_metal_nonce_finder.py    # 期望 4 个 [OK]
 
-# 3. Mine
-./scripts/start_stratum.sh <YOUR_PAYOUT_ADDRESS>
-# Custom worker name / pool:
-./scripts/start_stratum.sh <ADDRESS> m2-laptop stratum+tcp://your.pool:3333
+# 3. 开挖
+./scripts/start_stratum.sh <你的收款地址>
+
+# 自定义矿工名 / 矿池：
+./scripts/start_stratum.sh <地址> m2-laptop stratum+tcp://your.pool:3333
 ```
 
-The default pool is `stratum+tcp://btccmine.top:3333` (Bitcoin-Classic).
-Override with the third positional arg or the `POOL_URL` env var.
+默认矿池是 `stratum+tcp://btccmine.top:3333`（Bitcoin-Classic）。
+想换矿池可以传第三个参数，或者用 `POOL_URL` 环境变量。
 
-Typical log:
+典型日志：
 
 ```
 [stratum] connecting to btccmine.top:3333 ...
@@ -58,20 +55,21 @@ Typical log:
 [stratum] SHARE ACCEPTED  job=0000000e nonce=fdb4fd65 hash=00000000303a9fb3...
 ```
 
-## Solo mining (against your own node)
+`SHARE ACCEPTED` 就代表你的算力已经被矿池记录、参与分账。
 
-Run any Bitcoin Core-compatible daemon (`bitcoind`, `btccd`, etc.) yourself,
-then point the helper at it:
+## Solo 模式（连自己的节点）
+
+你需要先自己跑一个 Bitcoin Core 兼容的节点（`bitcoind` / `btccd` / …），然后：
 
 ```bash
 RPCHOST=127.0.0.1 RPCPORT=8332 RPCUSER=user RPCPASSWORD=pass \
-    ADDRESS=bc1qyourpayoutaddress \
+    ADDRESS=bc1qyouraddress \
     ./scripts/start_solo.sh
 ```
 
-Defaults: `127.0.0.1:28476` (BTCC default RPC port), user `user`, password `pass`.
+默认值：`127.0.0.1:28476`（BTCC 默认 RPC 端口）、用户 `user`、密码 `pass`。
 
-Or call `gbt_miner.py` directly:
+或者直接调 `gbt_miner.py`：
 
 ```bash
 python3 src/gbt_miner.py \
@@ -81,84 +79,71 @@ python3 src/gbt_miner.py \
     --gpu --gpu-binary src/metal_nonce_finder
 ```
 
-## Tuning
+## 调参
 
-Both the Stratum and solo paths accept the same GPU knobs:
+Stratum 和 solo 两条路径接受同样的 GPU 调参：
 
-| Flag | Default | Effect |
+| 参数 | 默认 | 作用 |
 |---|---|---|
-| `--gpu-batch` | `1<<27` (128M) pool / `1<<28` (256M) solo | Nonces per GPU subprocess call. Larger = better throughput, slower tip-change response. |
-| `--gpu-per-dispatch` | `1<<24` (16M) | Single-dispatch size. |
-| `--gpu-threadgroup` | `256` | Threads per Metal threadgroup. 256 is best on most Apple GPUs. |
+| `--gpu-batch` | 矿池 `1<<27`（128M） / solo `1<<28`（256M） | 每次 GPU 子进程扫多少 nonce。越大吞吐越好，但链尖切换响应越慢 |
+| `--gpu-per-dispatch` | `1<<24`（16M） | 单次 Metal dispatch 大小 |
+| `--gpu-threadgroup` | `256` | threadgroup 大小，多数 Apple GPU 取 256 最优 |
 
-Rule of thumb: aim for ~1 second per batch. At 500 MH/s that's `--gpu-batch 536870912` (512M).
+经验值：让一次 batch 大约 1 秒。500 MH/s × 1s ≈ `--gpu-batch 536870912`（512M）。
 
-## How it works
+## 工作原理
 
-The Metal kernel (`src/metal_nonce_finder.mm`) precomputes the SHA-256
-midstate of the first 64 bytes of the 80-byte block header on the CPU, then
-each GPU thread does:
+Metal 内核 (`src/metal_nonce_finder.mm`) 在 CPU 端预算 80 字节区块头前 64 字节的 SHA-256 midstate，然后每个 GPU 线程：
 
-1. Build the 16-word second SHA-256 block (merkle tail + ntime + nbits + per-thread nonce).
-2. Apply the precomputed midstate.
-3. Run a second full SHA-256 over the 32-byte intermediate hash.
-4. Byte-reverse and compare against the 256-bit BE target.
+1. 拼出第二个 16-word SHA-256 块（merkle 尾巴 + ntime + nbits + 本线程的 nonce）。
+2. 套用预算好的 midstate。
+3. 对 32 字节中间 hash 再做一次完整 SHA-256。
+4. 字节翻转后跟 256-bit big-endian target 比较。
 
-On a hit, atomic CAS records `(nonce, hash)` and the host process prints a
-single line of JSON:
+命中时用原子 CAS 记录 `(nonce, hash)`，host 进程打印一行 JSON：
 
 ```
 {"found": true, "nonce": 1234567, "hash": "0000abc...", "checked": ..., "elapsed_ms": ..., "hashrate": ...}
 ```
 
-The Python drivers (`stratum_miner.py`, `gbt_miner.py`) verify each candidate
-on the CPU before submitting, so a buggy GPU result can never produce an
-invalid block / share.
+Python 驱动（`stratum_miner.py` / `gbt_miner.py`）在 submit 之前会**用 CPU 再校验一遍**——即便 GPU 内核有 bug，也不会产生无效的 share / 区块。
 
-## Project layout
+## 目录结构
 
 ```
 apple-gpu-miner/
 ├── src/
-│   ├── metal_nonce_finder.mm   Apple Metal SHA-256d kernel + host driver (Objective-C++)
-│   ├── stratum_miner.py        Stratum v1 pool client
-│   └── gbt_miner.py            GBT solo client (any Bitcoin Core-compat node)
+│   ├── metal_nonce_finder.mm   Apple Metal SHA-256d 内核 + host 驱动（Objective-C++）
+│   ├── stratum_miner.py        Stratum v1 矿池客户端
+│   └── gbt_miner.py            GBT solo 客户端
 ├── scripts/
 │   ├── build_metal.sh          clang++ + Foundation + Metal → src/metal_nonce_finder
-│   ├── start_stratum.sh        One-line "mine to a pool" launcher
-│   └── start_solo.sh           One-line "mine to your bitcoind" launcher
+│   ├── start_stratum.sh        一键挖矿池
+│   └── start_solo.sh           一键挖自己节点
 ├── tests/
-│   └── smoke_metal_nonce_finder.py   GPU vs. Python hashlib byte-level check
+│   └── smoke_metal_nonce_finder.py   GPU vs Python hashlib 字节级一致性测试
 └── docs/
-    └── mining-macos.md         Full guide (Chinese)
+    └── mining-macos.md         详细中文使用指南
 ```
 
-## Performance notes
+## 性能
 
-- Base M2 (10-core GPU), `--gpu-batch=256M`: **~180–250 MH/s** sustained.
-- M2 Pro / Max: estimated 2–4×.
-- First batch is ~0.5 s slower because Metal compiles the shader at runtime.
-- Sustained mining will throttle without active cooling. A small fan helps.
+- 基础 M2 (10 核 GPU)，`--gpu-batch=256M`：稳定 **~180–250 MH/s**。
+- M2 Pro / Max：估计 2–4× 提升。
+- 第一个 batch 会慢约 0.5s（运行时编译 shader），之后稳定。
+- 长时间满载会让 M 系列芯片热降频；建议加个垫高架或小风扇。
 
-## Disclaimers
+## 重要提醒
 
-- Solo-mining Bitcoin mainnet on consumer hardware is **not economical**;
-  expected time-to-block is ~100 years per ~500 MH/s. Use a pool, or mine a
-  low-difficulty altchain / private network.
-- This software is provided "as is", under the MIT license. Mining
-  cryptocurrency may have legal and tax implications in your jurisdiction.
-- The included default pool address (`btccmine.top`) is for the
-  Bitcoin-Classic (BTCC) chain only. Don't point a BTC wallet at it (and
-  vice-versa) — the address formats are incompatible.
+- 在 Bitcoin 主网上用消费级硬件 solo 挖矿**完全不经济**——~500 MH/s 期望命中时间是 100 年级别。
+  请连矿池，或者去挖低难度的 altchain / 私有链。
+- 本软件按 MIT 协议提供，**不附带任何担保**。挖矿在某些司法辖区会涉及税务和合规问题，请自查。
+- 默认矿池地址 `btccmine.top` 仅适用于 Bitcoin-Classic (BTCC) 链。**不能**把 BTC 钱包地址塞给它，反过来也不行——地址格式不兼容。
 
-## Acknowledgements
+## 致谢
 
-This code was extracted and generalized from the macOS GPU-mining helpers in
-[Bitcoin-Classic](https://github.com/bitcoin-classic/bitcoin-classic).
-The Metal kernel structure (midstate + tail-only second compress) is the
-same well-known pattern used by `cgminer` / `bfgminer` / `cpuminer` for the
-last decade.
+代码从 [Bitcoin-Classic](https://github.com/bitcoin-classic/bitcoin-classic) 仓库中的 macOS GPU 挖矿组件抽取并通用化而来。Metal 内核的"midstate + 只跑 tail 第二次 compress"结构是十几年来 cgminer / bfgminer / cpuminer 一直在用的成熟模式。
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — 见 [LICENSE](LICENSE)。

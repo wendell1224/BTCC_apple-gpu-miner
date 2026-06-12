@@ -1,6 +1,6 @@
 # macOS（Apple Silicon）GPU 挖矿详细指南
 
-本文档是 [README_zh.md](../README_zh.md) 的扩展版，覆盖：
+本文档是 [README.md](../README.md) 的扩展版，覆盖：
 
 1. 编译 GPU 内核（`metal_nonce_finder`）
 2. 连矿池开挖（`stratum_miner.py`）
