@@ -1,4 +1,4 @@
-# apple-gpu-miner
+# BTCC_apple-gpu-miner
 
 苹果 Apple Silicon（M1 / M2 / M3 …）GPU 上跑的 SHA-256d 挖矿工具，
 基于 Metal 计算内核 + 纯 Python 标准库 Stratum v1 矿池客户端。
