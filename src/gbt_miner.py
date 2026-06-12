@@ -19,11 +19,12 @@ import json
 import os
 import random
 import struct
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from metal_helper import MetalGpuHelper
 
 
 def sha256d(b: bytes) -> bytes:
@@ -314,55 +315,6 @@ def build_block(
     return header + varint(len(txs)) + b"".join(txs)
 
 
-def run_gpu_search(
-    *,
-    gpu_binary: str,
-    header80: bytes,
-    target_be: bytes,
-    start_nonce: int,
-    count: int,
-    per_dispatch: int,
-    threadgroup: int,
-) -> dict:
-    """Invoke the Metal GPU helper for one batch.
-
-    Returns the helper's JSON dict, e.g.:
-      {"found": True, "nonce": N, "hash": "<hex BE display>",
-       "checked": N, "elapsed_ms": M, "hashrate": H}
-      {"found": False, "checked": N, "elapsed_ms": M, "hashrate": H}
-    """
-    if len(header80) != 80:
-        raise ValueError("header80 must be 80 bytes")
-    if len(target_be) != 32:
-        raise ValueError("target_be must be 32 bytes (big-endian)")
-    cmd = [
-        gpu_binary,
-        "--header-prefix", header80.hex(),
-        "--target", target_be.hex(),
-        "--start-nonce", str(int(start_nonce) & 0xFFFFFFFF),
-        "--count", str(int(count)),
-        "--per-dispatch", str(int(per_dispatch)),
-        "--threadgroup", str(int(threadgroup)),
-    ]
-    try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except FileNotFoundError as e:
-        raise RuntimeError(
-            f"GPU helper not found at '{gpu_binary}'. "
-            "Build it with miner/build_metal_miner.sh."
-        ) from e
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"GPU helper failed (rc={e.returncode}):\n"
-            f"stdout: {e.stdout}\nstderr: {e.stderr}"
-        ) from e
-
-    out = proc.stdout.strip().splitlines()
-    if not out:
-        raise RuntimeError(f"GPU helper produced no output. stderr: {proc.stderr}")
-    return json.loads(out[-1])
-
-
 def submit_block_everywhere(
     *,
     args: argparse.Namespace,
@@ -400,7 +352,8 @@ def submit_block_everywhere(
     return accepted_primary
 
 
-def mine_forever(args: argparse.Namespace) -> None:
+def mine_forever(args: argparse.Namespace,
+                 helper: Optional["MetalGpuHelper"] = None) -> None:
     cfg = RPCConfig(
         host=args.rpchost,
         port=args.rpcport,
@@ -418,6 +371,12 @@ def mine_forever(args: argparse.Namespace) -> None:
     print(f"[miner] RPC endpoint: http://{cfg.host}:{cfg.port}", flush=True)
     print(f"[miner] Wallet: {args.wallet}", flush=True)
     print(f"[miner] Mining payout: {payout_addr}", flush=True)
+
+    # Auto-tune batch size toward target_batch_seconds of GPU work, so
+    # callers don't have to know which Apple chip is on the machine.
+    auto_batch = (args.gpu_batch is None) or (int(args.gpu_batch) <= 0)
+    cur_gpu_batch = (1 << 25) if auto_batch else int(args.gpu_batch)
+    target_batch_seconds = float(args.gpu_target_seconds)
 
     blocks_found = 0
     last_prev = None
@@ -506,22 +465,25 @@ def mine_forever(args: argparse.Namespace) -> None:
                     if remaining_in_space <= 0:
                         print("[miner] Exhausted 32-bit nonce space; bumping extranonce", flush=True)
                         break
-                    batch_size = min(int(args.gpu_batch), remaining_in_space)
+                    batch_size = min(int(cur_gpu_batch), remaining_in_space)
                     batch_start = (start_nonce + total_checked) & 0xFFFFFFFF
 
-                    result = run_gpu_search(
-                        gpu_binary=args.gpu_binary,
+                    assert helper is not None
+                    result = helper.search(
                         header80=header_template,
                         target_be=target_be_bytes,
                         start_nonce=batch_start,
                         count=batch_size,
-                        per_dispatch=int(args.gpu_per_dispatch),
-                        threadgroup=int(args.gpu_threadgroup),
                     )
 
                     total_checked += batch_size
                     dt = max(time.time() - t0, 1e-6)
                     hr_kernel = int(result.get("hashrate", 0))
+                    # Adapt batch size toward target_batch_seconds of GPU work.
+                    if auto_batch and hr_kernel > 0:
+                        desired = int(hr_kernel * target_batch_seconds)
+                        desired = max(1 << 22, min(desired, 1 << 30))
+                        cur_gpu_batch = (cur_gpu_batch * 3 + desired) // 4
                     print(
                         f"[miner] gpu ~{hr_kernel/1e6:.2f} MH/s (effective "
                         f"{total_checked/dt/1e6:.2f} MH/s) "
@@ -693,24 +655,50 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Use the Metal (Apple Silicon) GPU helper for nonce search.")
     p.add_argument("--gpu-binary", default=default_gpu_bin,
                    help="Path to the metal_nonce_finder binary "
-                        "(build with miner/build_metal_miner.sh).")
-    p.add_argument("--gpu-batch", type=int, default=1 << 28,
-                   help="Nonces to scan per GPU subprocess call. Default 268435456 (256M). "
-                        "Tip-change responsiveness ~= batch / hashrate.")
-    p.add_argument("--gpu-per-dispatch", type=int, default=1 << 24,
-                   help="Nonces per single Metal dispatch within a batch (default 16M).")
-    p.add_argument("--gpu-threadgroup", type=int, default=256,
-                   help="Threads per Metal threadgroup (default 256).")
+                        "(build with scripts/build_metal.sh).")
+
+    # All three GPU knobs default to 0 = auto-tune. The Metal helper detects
+    # the host's GPU core count via IOKit and picks threadgroup/per-dispatch
+    # for itself; the Python driver adapts batch size to ~--gpu-target-seconds
+    # of work using the helper's reported hashrate. None of these need to be
+    # set by hand even when moving between M1/M2/M3/M4 base/Pro/Max/Ultra.
+    p.add_argument("--gpu-batch", type=int, default=0,
+                   help="Nonces per GPU search call (0 = auto-tune to "
+                        "~--gpu-target-seconds of work).")
+    p.add_argument("--gpu-target-seconds", type=float, default=2.0,
+                   help="When --gpu-batch=0, target this many seconds per "
+                        "GPU call. Smaller = faster tip-change responsiveness.")
+    p.add_argument("--gpu-per-dispatch", type=int, default=0,
+                   help="Per Metal dispatch size (0 = auto, scaled to GPU cores).")
+    p.add_argument("--gpu-threadgroup", type=int, default=0,
+                   help="Threads per Metal threadgroup (0 = auto).")
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     args.max_blocks = int(args.max_blocks) if args.max_blocks else 0
+
+    # Persistent GPU helper — Metal shader compiled and GPU probed once,
+    # then reused for every batch.
+    helper: Optional[MetalGpuHelper] = None
+    if args.gpu:
+        helper = MetalGpuHelper(
+            args.gpu_binary,
+            threadgroup=int(args.gpu_threadgroup),
+            per_dispatch=int(args.gpu_per_dispatch),
+        )
+
     try:
-        mine_forever(args)
+        mine_forever(args, helper=helper)
     except KeyboardInterrupt:
         print("\n[miner] interrupted", flush=True)
+    finally:
+        if helper is not None:
+            try:
+                helper.close()
+            except Exception:
+                pass
     return 0
 
 

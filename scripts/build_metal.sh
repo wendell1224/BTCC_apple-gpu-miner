@@ -28,7 +28,7 @@ fi
 echo "[build_metal] arch=$(uname -m)  compiling $SRC ..."
 clang++ -std=c++17 -O3 -fobjc-arc \
     -Wall -Wno-deprecated-declarations \
-    -framework Foundation -framework Metal \
+    -framework Foundation -framework Metal -framework IOKit \
     -o "$OUT" "$SRC"
 
 echo "[build_metal] built: $OUT"

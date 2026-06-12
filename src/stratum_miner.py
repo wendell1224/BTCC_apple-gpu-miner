@@ -31,13 +31,14 @@ import queue
 import random
 import socket
 import struct
-import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlparse
+
+from metal_helper import MetalGpuHelper
 
 # Bitcoin diff-1 target (256-bit big-endian integer).
 DIFF1_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
@@ -268,30 +269,6 @@ def build_block_header(
     return header, mr_le
 
 
-def run_gpu_search(
-    *,
-    gpu_binary: str,
-    header80: bytes,
-    target_be: bytes,
-    start_nonce: int,
-    count: int,
-    per_dispatch: int,
-    threadgroup: int,
-) -> dict:
-    cmd = [
-        gpu_binary,
-        "--header-prefix", header80.hex(),
-        "--target", target_be.hex(),
-        "--start-nonce", str(int(start_nonce) & 0xFFFFFFFF),
-        "--count", str(int(count)),
-        "--per-dispatch", str(int(per_dispatch)),
-        "--threadgroup", str(int(threadgroup)),
-    ]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    line = proc.stdout.strip().splitlines()[-1]
-    return json.loads(line)
-
-
 def cpu_search(*, header80: bytes, target_int: int, start_nonce: int, count: int) -> dict:
     """Pure-Python SHA-256d nonce loop. Slow (~50 KH/s); use only as fallback."""
     t0 = time.time()
@@ -319,7 +296,8 @@ def cpu_search(*, header80: bytes, target_int: int, start_nonce: int, count: int
     }
 
 
-def mine_session(args: argparse.Namespace, host: str, port: int) -> str:
+def mine_session(args: argparse.Namespace, host: str, port: int,
+                 *, helper: Optional["MetalGpuHelper"] = None) -> str:
     """Run one Stratum session against (host, port). Returns a short reason
     string when the session ends ("disconnect", "subscribe_failed", etc).
     Raises KeyboardInterrupt to bubble up Ctrl-C."""
@@ -411,6 +389,14 @@ def mine_session(args: argparse.Namespace, host: str, port: int) -> str:
     started_at = time.time()
     last_status = started_at
 
+    # GPU batch size is auto-tuned to ~target_batch_seconds of work so the
+    # caller doesn't have to pick a value per chip. It starts at 16 M nonces
+    # (a few hundred ms on any M-series GPU) and adapts toward the observed
+    # hashrate after each pass.
+    auto_batch = (args.gpu_batch is None) or (int(args.gpu_batch) <= 0)
+    cur_gpu_batch = (1 << 24) if auto_batch else int(args.gpu_batch)
+    target_batch_seconds = float(args.gpu_target_seconds)
+
     while client.connected:
         # Wait until we have a job AND a difficulty.
         with state.lock:
@@ -442,15 +428,22 @@ def mine_session(args: argparse.Namespace, host: str, port: int) -> str:
         # Hash budget per pass. New job interrupts mid-pass via clean_jobs/new event.
         start_nonce = random.getrandbits(32)
         if args.gpu:
-            res = run_gpu_search(
-                gpu_binary=args.gpu_binary,
+            assert helper is not None
+            res = helper.search(
                 header80=header_template,
                 target_be=target_be,
                 start_nonce=start_nonce,
-                count=int(args.gpu_batch),
-                per_dispatch=int(args.gpu_per_dispatch),
-                threadgroup=int(args.gpu_threadgroup),
+                count=int(cur_gpu_batch),
             )
+            # Auto-tune cur_gpu_batch toward target_batch_seconds of GPU work.
+            if auto_batch:
+                checked = int(res.get("checked", 0))
+                elapsed_ms = float(res.get("elapsed_ms", 0.0))
+                if checked > 0 and elapsed_ms > 0.0:
+                    actual_hps = checked * 1000.0 / elapsed_ms
+                    desired = int(actual_hps * target_batch_seconds)
+                    desired = max(1 << 22, min(desired, 1 << 30))
+                    cur_gpu_batch = (cur_gpu_batch * 3 + desired) // 4
         else:
             res = cpu_search(
                 header80=header_template,
@@ -541,42 +534,73 @@ def mine(args: argparse.Namespace) -> None:
         print(f"[stratum] bad --url: {args.url}", flush=True)
         sys.exit(2)
 
-    backoff = 5
-    while True:
-        try:
-            reason = mine_session(args, host, port)
-        except KeyboardInterrupt:
-            raise
-        except (ConnectionRefusedError, ConnectionResetError, socket.gaierror,
-                socket.timeout, OSError) as e:
-            print(f"[stratum] connection error: {e}", flush=True)
-            reason = "connection_error"
-        except Exception as e:
-            print(f"[stratum] unexpected error: {type(e).__name__}: {e}", flush=True)
-            reason = "exception"
-
-        # Fatal config issues: back off a lot so we don't spam the pool.
-        if reason in ("authorize_failed",):
-            wait = 120
-        elif reason in ("subscribe_failed", "subscribe_parse_failed"):
-            wait = 60
-        elif reason == "disconnect_stable":
-            # We had a healthy session before being dropped - retry quickly.
-            wait = 5
-            backoff = 5
-        else:
-            wait = backoff
-            backoff = min(backoff * 2, 60)
-
-        print(
-            f"[stratum] session ended ({reason}); reconnecting in {wait}s "
-            f"(Ctrl-C to abort) ...",
-            flush=True,
+    # The GPU helper is started once for the entire process: shader
+    # compilation and GPU detection happen exactly once, regardless of how
+    # many times the pool socket reconnects.
+    helper: Optional[MetalGpuHelper] = None
+    if args.gpu:
+        helper = MetalGpuHelper(
+            args.gpu_binary,
+            threadgroup=int(args.gpu_threadgroup),
+            per_dispatch=int(args.gpu_per_dispatch),
         )
-        try:
-            time.sleep(wait)
-        except KeyboardInterrupt:
-            raise
+
+    backoff = 5
+    try:
+        while True:
+            try:
+                reason = mine_session(args, host, port, helper=helper)
+            except KeyboardInterrupt:
+                raise
+            except (ConnectionRefusedError, ConnectionResetError, socket.gaierror,
+                    socket.timeout, OSError) as e:
+                print(f"[stratum] connection error: {e}", flush=True)
+                reason = "connection_error"
+            except Exception as e:
+                print(f"[stratum] unexpected error: {type(e).__name__}: {e}", flush=True)
+                reason = "exception"
+                # If the GPU helper subprocess died, restart it before the
+                # next session so we don't blow up on the first share.
+                if (
+                    args.gpu
+                    and isinstance(e, RuntimeError)
+                    and "GPU helper" in str(e)
+                ):
+                    print("[stratum] restarting GPU helper ...", flush=True)
+                    if helper is not None:
+                        try: helper.close()
+                        except Exception: pass
+                    helper = MetalGpuHelper(
+                        args.gpu_binary,
+                        threadgroup=int(args.gpu_threadgroup),
+                        per_dispatch=int(args.gpu_per_dispatch),
+                    )
+
+            # Fatal config issues: back off a lot so we don't spam the pool.
+            if reason in ("authorize_failed",):
+                wait = 120
+            elif reason in ("subscribe_failed", "subscribe_parse_failed"):
+                wait = 60
+            elif reason == "disconnect_stable":
+                wait = 5
+                backoff = 5
+            else:
+                wait = backoff
+                backoff = min(backoff * 2, 60)
+
+            print(
+                f"[stratum] session ended ({reason}); reconnecting in {wait}s "
+                f"(Ctrl-C to abort) ...",
+                flush=True,
+            )
+            try:
+                time.sleep(wait)
+            except KeyboardInterrupt:
+                raise
+    finally:
+        if helper is not None:
+            try: helper.close()
+            except Exception: pass
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -591,11 +615,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--gpu", action="store_true",
                    help="Use the Metal GPU helper for nonce search.")
     p.add_argument("--gpu-binary", default=default_gpu_bin)
-    p.add_argument("--gpu-batch", type=int, default=1 << 27,
-                   help="Nonces per GPU subprocess call (default 128M). Pool difficulty "
-                        "is low enough that most calls return a share quickly.")
-    p.add_argument("--gpu-per-dispatch", type=int, default=1 << 24)
-    p.add_argument("--gpu-threadgroup", type=int, default=256)
+
+    # All three GPU knobs default to 0 = auto-tune. The Metal helper detects
+    # the host's GPU core count via IOKit and picks threadgroup/per-dispatch
+    # for itself, and the Python driver adapts batch size to ~1 s of work
+    # using the helper's reported hashrate. None of these need to be set by
+    # hand even when moving between M1/M2/M3/M4 base/Pro/Max/Ultra parts.
+    p.add_argument("--gpu-batch", type=int, default=0,
+                   help="Nonces per GPU search call (0 = auto-tune to "
+                        "~--gpu-target-seconds of work).")
+    p.add_argument("--gpu-target-seconds", type=float, default=1.0,
+                   help="When --gpu-batch=0, target this many seconds per "
+                        "GPU call. Smaller = faster job-switch latency.")
+    p.add_argument("--gpu-per-dispatch", type=int, default=0,
+                   help="Per Metal dispatch size (0 = auto, scaled to GPU cores).")
+    p.add_argument("--gpu-threadgroup", type=int, default=0,
+                   help="Threads per Metal threadgroup (0 = auto).")
 
     p.add_argument("--cpu-batch", type=int, default=1 << 18,
                    help="Nonces per CPU pass when --gpu is not used (default 256K).")

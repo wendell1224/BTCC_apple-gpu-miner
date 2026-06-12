@@ -105,36 +105,39 @@ python3 src/gbt_miner.py \
 | 后端 | M2 (10 核 GPU) | M2 Pro/Max（估计） | 备注 |
 |---|---|---|---|
 | 纯 Python CPU | ~40–80 KH/s | ~50–100 KH/s | 仅作 fallback / 演示 |
-| Metal GPU | **~180–250 MH/s** | ~400–800 MH/s | 默认参数 |
+| Metal GPU（自动调参） | **~178–180 MH/s** 持续 | ~400–800 MH/s | 默认参数（双 cb 流水线） |
 
 GPU 路径相对 Python CPU 提升约 **2000–5000 倍**。
 
-> 实际数字会因 `--gpu-batch`、`--gpu-per-dispatch`、热降频、并发负载而浮动。
-> 第一次启动有约 0.5 秒的 Metal shader 编译开销，之后每 batch 是稳定的。
+> 启动时 stderr 会打印一行类似  
+> `[metal] device="Apple M2" gpu_cores=10 threadExecutionWidth=32 maxTPT=576 threadgroup=576 per_dispatch=20971520 (20.0M) [auto]`，  
+> 表明自动检测出的 GPU 核数和挑选的 threadgroup / per-dispatch。  
+> 持久化 helper 让 Metal shader 整个会话只编译一次（约 0.5 s），不再每个 batch 都付一次。
 
 ---
 
-## 5. 参数调优
+## 5. 参数调优（默认即最优，一般不用动）
 
-矿工脚本默认参数已经比较合理。需要调时直接在启动命令后追加，会透传到 Python 矿工：
+GPU 三个参数全部默认 `0 = auto`，**M 系列芯片不需要指定型号**：
+
+| 参数 | 默认 | 自动行为 |
+|---|---|---|
+| `--gpu-batch` | `0` | 按观测算力自调，让单次搜索≈ `--gpu-target-seconds` 秒 |
+| `--gpu-target-seconds` | stratum `1.0` / solo `2.0` | 越小切 job 越快，越大开销摊得越薄 |
+| `--gpu-per-dispatch` | `0` | 用 IOKit 拿到的 GPU 核数算（基本上 `cores × 2 M`，4 M~64 M 之间） |
+| `--gpu-threadgroup` | `0` | Metal pipeline 自己报告的 `maxTotalThreadsPerThreadgroup`（M2 上 SHA-256d 内核 = 576） |
+
+如果你确实想手工锁定某个值，正整数就是手动锁定，`0` 就是恢复 auto：
 
 ```bash
-./scripts/start_stratum.sh cc1q.... m2-test "" \
-    --gpu-batch 134217728 \         # 每次 GPU 子进程扫多少 nonce（默认 128M）
-    --gpu-per-dispatch 33554432 \   # 单次 Metal dispatch 大小（默认 16M）
-    --gpu-threadgroup 256           # threadgroup 大小，多数情况 256 最佳
+# 手动锁 batch=128M（不再自动调整）
+./scripts/start_stratum.sh cc1q.... m2-test "" --gpu-batch 134217728
+
+# 让一次 batch 大约 0.3 秒（job 切换更快）
+./scripts/start_stratum.sh cc1q.... m2-test "" --gpu-target-seconds 0.3
 ```
 
-### 5.1 `--gpu-batch` 怎么选？
-
-- **越大** → GPU 利用率越高（启动开销摊薄），但**对 job 切换的响应越慢**。
-- **越小** → 越早能感知到新 job，但启动开销占比变高。
-
-经验值：让一次 batch 大约 1 秒。500 MH/s × 1s ≈ `--gpu-batch 536870912`（512M）。
-
-主网每 10 分钟一个块，矿池每秒就有新 share，batch 用 128M（默认）很合理。
-
-### 5.2 CPU 后端
+### 5.1 CPU 后端
 
 不带 `--gpu`，或者 `gbt_miner.py` 不传 `--gpu`，就是纯 Python CPU 路径。仅推荐用于：
 

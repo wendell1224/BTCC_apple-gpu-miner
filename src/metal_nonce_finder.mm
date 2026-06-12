@@ -1,34 +1,53 @@
 // metal_nonce_finder.mm
 //
 // SHA-256d nonce searcher on Apple Silicon GPU via Metal.
-// Called as a subprocess by miner/gbt_miner.py when --gpu is enabled.
+// Called by stratum_miner.py / gbt_miner.py.
 //
 // Build:
 //   clang++ -std=c++17 -O3 -fobjc-arc \
-//       -framework Foundation -framework Metal \
+//       -framework Foundation -framework Metal -framework IOKit \
 //       -o metal_nonce_finder metal_nonce_finder.mm
 //
-// Usage:
-//   metal_nonce_finder \
-//       --header-prefix <160 hex chars: full 80-byte serialized block header,
-//                                       nonce field can be anything (overwritten)>
-//       --target        <64 hex chars: 32-byte BE target (most significant byte first)>
-//       --start-nonce   <uint32 decimal>
-//       --count         <uint64 decimal: how many nonces to scan>
-//       [--per-dispatch <uint32, default 16777216 = 16M>]
-//       [--threadgroup  <uint32, default 256>]
+// Two run modes:
 //
-// Output (stdout, one line of JSON):
-//   {"found": true,  "nonce": N, "hash": "<64 hex BE display>",
-//    "checked": N, "elapsed_ms": M, "hashrate": H}
-//   {"found": false, "checked": N, "elapsed_ms": M, "hashrate": H}
+//   1) One-shot (back-compat with smoke tests):
+//      metal_nonce_finder \
+//          --header-prefix <160 hex chars: 80-byte block header>
+//          --target        <64 hex chars: 32-byte BE target>
+//          --start-nonce   <uint32 decimal>
+//          --count         <uint64 decimal: how many nonces to scan>
+//          [--per-dispatch <uint32; 0 or omitted = auto-tune>]
+//          [--threadgroup  <uint32; 0 or omitted = auto-tune>]
+//
+//   2) Persistent (preferred; eliminates per-batch fork + Metal recompile):
+//      metal_nonce_finder --persistent
+//      Reads one JSON job per line on stdin:
+//          {"header_prefix": "<160 hex>", "target": "<64 hex>",
+//           "start_nonce": N, "count": M}
+//      Writes one JSON result per line on stdout:
+//          {"found": true,  "nonce": N, "hash": "<64 hex BE>",
+//           "checked": N, "elapsed_ms": M, "hashrate": H}
+//          {"found": false, "checked": N, "elapsed_ms": M, "hashrate": H}
+//      Exits cleanly on stdin EOF.
+//
+// Auto-tuning:
+//   - GPU core count is queried via IOKit (AGXAccelerator / gpu-core-count).
+//   - Threadgroup defaults to a round multiple of threadExecutionWidth that
+//     fits the SHA-256d kernel's register pressure (typically 256).
+//   - per-dispatch defaults to a value that gives ~50-100 ms per dispatch on
+//     the detected hardware (scaled by core count, with a floor and ceiling).
+//   - Two MTLCommandBuffers are pipelined to keep the GPU saturated while
+//     the host prepares the next dispatch.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOKit/IOKitLib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 // ---------------------------------------------------------------------------
 // Metal kernel source (compiled at runtime via newLibraryWithSource:).
@@ -170,6 +189,40 @@ kernel void sha256d_search(
 )METAL";
 
 // ---------------------------------------------------------------------------
+// GPU introspection: detect the number of GPU cores via IOKit so we can
+// size dispatches without the user telling us which Apple chip we're on.
+// Returns 0 if unknown.
+// ---------------------------------------------------------------------------
+static uint32_t detect_gpu_core_count(void) {
+    io_iterator_t iter = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                     IOServiceMatching("AGXAccelerator"),
+                                     &iter) != KERN_SUCCESS) {
+        return 0;
+    }
+    uint32_t cores = 0;
+    io_service_t service;
+    while ((service = IOIteratorNext(iter))) {
+        CFTypeRef cf = IORegistryEntrySearchCFProperty(
+            service, kIOServicePlane,
+            CFSTR("gpu-core-count"), kCFAllocatorDefault,
+            kIORegistryIterateRecursively);
+        if (cf) {
+            if (CFGetTypeID(cf) == CFNumberGetTypeID()) {
+                int32_t v = 0;
+                CFNumberGetValue((CFNumberRef)cf, kCFNumberSInt32Type, &v);
+                if (v > 0) cores = (uint32_t)v;
+            }
+            CFRelease(cf);
+        }
+        IOObjectRelease(service);
+        if (cores > 0) break;
+    }
+    IOObjectRelease(iter);
+    return cores;
+}
+
+// ---------------------------------------------------------------------------
 // CPU helpers: hex parsing + SHA-256 (for midstate precompute).
 // ---------------------------------------------------------------------------
 static int parseHex(const char *hex, uint8_t *out, size_t out_len) {
@@ -235,8 +288,9 @@ int main(int argc, const char *argv[]) {
     const char *hexTarget = NULL;
     uint32_t startNonce = 0;
     uint64_t totalCount = 1ull << 24;
-    uint64_t perDispatch = 1ull << 24;       // 16M nonces per GPU dispatch
-    uint32_t threadgroupSize = 256;
+    uint64_t perDispatch_user = 0;        // 0 = auto-tune
+    uint32_t threadgroupSize_user = 0;    // 0 = auto-tune
+    bool persistent = false;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -244,63 +298,31 @@ int main(int argc, const char *argv[]) {
         else if (!strcmp(a, "--target")        && i+1<argc) hexTarget = argv[++i];
         else if (!strcmp(a, "--start-nonce")   && i+1<argc) startNonce = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(a, "--count")         && i+1<argc) totalCount = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--per-dispatch")  && i+1<argc) perDispatch = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--threadgroup")   && i+1<argc) threadgroupSize = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--per-dispatch")  && i+1<argc) perDispatch_user = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--threadgroup")   && i+1<argc) threadgroupSize_user = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--persistent"))                persistent = true;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
             fprintf(stderr,
                 "metal_nonce_finder: SHA-256d nonce search on Apple Silicon GPU\n"
+                "\n"
+                "One-shot:\n"
                 "  --header-prefix <160 hex chars (80 bytes)>\n"
                 "  --target        <64 hex chars (32 bytes BE)>\n"
                 "  --start-nonce   <uint32>\n"
                 "  --count         <uint64>\n"
-                "  --per-dispatch  <uint64, default 16M>\n"
-                "  --threadgroup   <uint32, default 256>\n");
+                "  --per-dispatch  <uint64; 0 or omit = auto>\n"
+                "  --threadgroup   <uint32; 0 or omit = auto>\n"
+                "\n"
+                "Persistent (preferred):\n"
+                "  --persistent  read one job JSON per line on stdin,\n"
+                "                emit one result JSON per line on stdout.\n"
+                "                Auto-tunes per-dispatch and threadgroup once at startup.\n");
             return 0;
         }
         else { fprintf(stderr, "metal_nonce_finder: unknown arg: %s\n", a); return 2; }
     }
-    if (!hexHeader || !hexTarget) {
-        fprintf(stderr, "metal_nonce_finder: --header-prefix and --target are required\n");
-        return 2;
-    }
 
-    uint8_t header[80];
-    if (parseHex(hexHeader, header, 80) != 0) {
-        fprintf(stderr, "metal_nonce_finder: bad --header-prefix (need 160 hex chars)\n");
-        return 2;
-    }
-    uint8_t target[32];
-    if (parseHex(hexTarget, target, 32) != 0) {
-        fprintf(stderr, "metal_nonce_finder: bad --target (need 64 hex chars)\n");
-        return 2;
-    }
-
-    // Midstate = SHA-256 state after consuming bytes [0..64).
-    uint32_t midstate[8] = {
-        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-        0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
-    };
-    sha256_compress_cpu(midstate, header);
-
-    // Tail words 0..2 = header bytes [64..76) packed BE; bytes [76..80) (nonce)
-    // are filled by the kernel per thread.
-    uint32_t tail_words[3];
-    for (int i = 0; i < 3; i++) {
-        tail_words[i] = ((uint32_t)header[64 + i*4]     << 24)
-                      | ((uint32_t)header[64 + i*4 + 1] << 16)
-                      | ((uint32_t)header[64 + i*4 + 2] <<  8)
-                      | ((uint32_t)header[64 + i*4 + 3]);
-    }
-
-    uint32_t target_be[8];
-    for (int i = 0; i < 8; i++) {
-        target_be[i] = ((uint32_t)target[i*4]     << 24)
-                     | ((uint32_t)target[i*4 + 1] << 16)
-                     | ((uint32_t)target[i*4 + 2] <<  8)
-                     | ((uint32_t)target[i*4 + 3]);
-    }
-
-    // ---------------- Metal setup ----------------
+    // ---------------- Metal setup (one time) ----------------
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) { fprintf(stderr, "Metal device not available\n"); return 3; }
 
@@ -318,76 +340,271 @@ int main(int argc, const char *argv[]) {
     if (!pipe) { fprintf(stderr, "pipeline error: %s\n", err.description.UTF8String); return 3; }
 
     NSUInteger maxTPB = pipe.maxTotalThreadsPerThreadgroup;
-    if (threadgroupSize > maxTPB) threadgroupSize = (uint32_t)maxTPB;
+    NSUInteger tew    = pipe.threadExecutionWidth;
+    uint32_t gpu_cores = detect_gpu_core_count();
+
+    // Auto-tune threadgroup. The pipeline's
+    // maxTotalThreadsPerThreadgroup is what the GPU itself reports as the
+    // largest threadgroup our SHA-256d kernel can fit given its register
+    // pressure (typically 576 on the M2 family). Empirically that gives
+    // the best throughput; smaller threadgroups leave compute on the
+    // table. Always round down to a multiple of threadExecutionWidth (32).
+    uint32_t threadgroup;
+    if (threadgroupSize_user == 0) {
+        uint32_t want = (uint32_t)maxTPB;
+        if (tew > 0) {
+            want = (want / (uint32_t)tew) * (uint32_t)tew;
+            if (want == 0) want = (uint32_t)tew;
+        }
+        if (want == 0) want = 256;     // last-resort fallback
+        threadgroup = want;
+    } else {
+        threadgroup = threadgroupSize_user;
+        if ((NSUInteger)threadgroup > maxTPB) threadgroup = (uint32_t)maxTPB;
+    }
+
+    // Auto-tune per-dispatch. We want a dispatch big enough to hide host
+    // overhead but small enough to remain responsive. Heuristic:
+    //   per_dispatch ~ gpu_cores * 2M nonces, clamped to [4M, 64M].
+    // M2 (10 GPU cores) -> 20M, snapped to 16M; M2 Max (~32 cores) -> 64M;
+    // unknown core count -> 16M (matches the previous static default).
+    uint32_t per_dispatch;
+    if (perDispatch_user == 0) {
+        uint32_t cores_eff = gpu_cores ? gpu_cores : 8;
+        uint64_t pd = (uint64_t)cores_eff * (1u << 21);  // 2M nonces / GPU core
+        if (pd < (1u << 22)) pd = (1u << 22);   // floor:  4M
+        if (pd > (1u << 26)) pd = (1u << 26);   // ceil : 64M
+        per_dispatch = (uint32_t)pd;
+    } else {
+        per_dispatch = (uint32_t)perDispatch_user;
+        if (per_dispatch == 0) per_dispatch = 1u << 24;
+    }
+
+    fprintf(stderr,
+            "[metal] device=\"%s\" gpu_cores=%u threadExecutionWidth=%lu "
+            "maxTPT=%lu threadgroup=%u per_dispatch=%u (%.1fM)%s\n",
+            device.name.UTF8String,
+            gpu_cores,
+            (unsigned long)tew,
+            (unsigned long)maxTPB,
+            threadgroup,
+            per_dispatch,
+            per_dispatch / 1048576.0,
+            (perDispatch_user == 0 || threadgroupSize_user == 0) ? " [auto]" : "");
+    fflush(stderr);
 
     id<MTLCommandQueue> q = [device newCommandQueue];
 
-    id<MTLBuffer> bMid  = [device newBufferWithBytes:midstate   length:sizeof(midstate)
-                                             options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bTail = [device newBufferWithBytes:tail_words length:sizeof(tail_words)
-                                             options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bTgt  = [device newBufferWithBytes:target_be  length:sizeof(target_be)
-                                             options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bFlag = [device newBufferWithLength:sizeof(uint32_t)
+    // Pre-allocate the parameter buffers (rewritten per-job in persistent mode).
+    id<MTLBuffer> bMid  = [device newBufferWithLength:32
                                               options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bNon  = [device newBufferWithLength:sizeof(uint32_t)
+    id<MTLBuffer> bTail = [device newBufferWithLength:12
                                               options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bHash = [device newBufferWithLength:32
+    id<MTLBuffer> bTgt  = [device newBufferWithLength:32
                                               options:MTLResourceStorageModeShared];
-
-    uint64_t done = 0;
-    double t0 = monotime();
-
-    while (done < totalCount) {
-        uint64_t left = totalCount - done;
-        uint32_t batch = (uint32_t)(left < perDispatch ? left : perDispatch);
-        uint32_t batchStart = (uint32_t)(startNonce + (uint32_t)done);
-
-        *(uint32_t*)bFlag.contents = 0;
-
-        id<MTLCommandBuffer> cb = [q commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:pipe];
-        [enc setBuffer:bMid  offset:0 atIndex:0];
-        [enc setBuffer:bTail offset:0 atIndex:1];
-        [enc setBuffer:bTgt  offset:0 atIndex:2];
-        [enc setBytes:&batchStart length:sizeof(uint32_t) atIndex:3];
-        [enc setBuffer:bFlag offset:0 atIndex:4];
-        [enc setBuffer:bNon  offset:0 atIndex:5];
-        [enc setBuffer:bHash offset:0 atIndex:6];
-
-        MTLSize grid = MTLSizeMake(batch, 1, 1);
-        MTLSize tg   = MTLSizeMake(threadgroupSize, 1, 1);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
-
-        done += batch;
-
-        if (*(uint32_t*)bFlag.contents) {
-            uint32_t foundNonce = *(uint32_t*)bNon.contents;
-            uint32_t *hw = (uint32_t*)bHash.contents;
-            char hexHash[65]; hexHash[64] = 0;
-            for (int i = 0; i < 8; i++) snprintf(hexHash + i*8, 9, "%08x", hw[i]);
-
-            double dt = monotime() - t0;
-            uint64_t hps = dt > 0 ? (uint64_t)((double)done / dt) : 0;
-            printf("{\"found\": true, \"nonce\": %u, \"hash\": \"%s\","
-                   " \"checked\": %llu, \"elapsed_ms\": %.3f, \"hashrate\": %llu}\n",
-                   foundNonce, hexHash,
-                   (unsigned long long)done, dt * 1000.0,
-                   (unsigned long long)hps);
-            fflush(stdout);
-            return 0;
-        }
+    // Two ping-pong slots for result buffers so we can keep up to two
+    // command buffers in flight at once.
+    id<MTLBuffer> bFlag[2];
+    id<MTLBuffer> bNon[2];
+    id<MTLBuffer> bHash[2];
+    for (int i = 0; i < 2; i++) {
+        bFlag[i] = [device newBufferWithLength:sizeof(uint32_t)
+                                       options:MTLResourceStorageModeShared];
+        bNon[i]  = [device newBufferWithLength:sizeof(uint32_t)
+                                       options:MTLResourceStorageModeShared];
+        bHash[i] = [device newBufferWithLength:32
+                                       options:MTLResourceStorageModeShared];
     }
 
-    double dt = monotime() - t0;
-    uint64_t hps = dt > 0 ? (uint64_t)((double)done / dt) : 0;
-    printf("{\"found\": false, \"checked\": %llu, \"elapsed_ms\": %.3f, \"hashrate\": %llu}\n",
-           (unsigned long long)done, dt * 1000.0, (unsigned long long)hps);
-    fflush(stdout);
+    // -----------------------------------------------------------------------
+    // run_search: scan [start_nonce, start_nonce + total_count) for a hash
+    // <= target. Two MTLCommandBuffers are kept in flight (the just-encoded
+    // one is dispatched while we wait on the previous one's result), which
+    // saturates the GPU instead of leaving it idle during host bookkeeping.
+    // Prints exactly one JSON line on stdout for the result.
+    // -----------------------------------------------------------------------
+    auto run_search = [&](const uint8_t header[80], const uint8_t target[32],
+                          uint32_t start_nonce, uint64_t total_count) {
+        uint32_t midstate[8] = {
+            0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+            0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
+        };
+        sha256_compress_cpu(midstate, header);
+
+        uint32_t tail_words[3];
+        for (int i = 0; i < 3; i++) {
+            tail_words[i] = ((uint32_t)header[64 + i*4]     << 24)
+                          | ((uint32_t)header[64 + i*4 + 1] << 16)
+                          | ((uint32_t)header[64 + i*4 + 2] <<  8)
+                          | ((uint32_t)header[64 + i*4 + 3]);
+        }
+
+        uint32_t target_be[8];
+        for (int i = 0; i < 8; i++) {
+            target_be[i] = ((uint32_t)target[i*4]     << 24)
+                         | ((uint32_t)target[i*4 + 1] << 16)
+                         | ((uint32_t)target[i*4 + 2] <<  8)
+                         | ((uint32_t)target[i*4 + 3]);
+        }
+
+        memcpy(bMid.contents,  midstate,   32);
+        memcpy(bTail.contents, tail_words, 12);
+        memcpy(bTgt.contents,  target_be,  32);
+
+        double t0 = monotime();
+        uint64_t committed = 0;
+        uint64_t done = 0;
+        int slot = 0;
+
+        id<MTLCommandBuffer> prev_cb = nil;
+        int prev_slot = -1;
+        uint64_t prev_batch = 0;
+
+        bool found = false;
+        uint32_t found_nonce = 0;
+        uint32_t found_hash[8] = {0};
+
+        while (committed < total_count) {
+            uint64_t left = total_count - committed;
+            uint32_t batch = (uint32_t)((left < per_dispatch) ? left : per_dispatch);
+            uint32_t batch_start = (uint32_t)(start_nonce + (uint32_t)committed);
+
+            *(uint32_t*)bFlag[slot].contents = 0;
+
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:bMid  offset:0 atIndex:0];
+            [enc setBuffer:bTail offset:0 atIndex:1];
+            [enc setBuffer:bTgt  offset:0 atIndex:2];
+            [enc setBytes:&batch_start length:sizeof(uint32_t) atIndex:3];
+            [enc setBuffer:bFlag[slot] offset:0 atIndex:4];
+            [enc setBuffer:bNon[slot]  offset:0 atIndex:5];
+            [enc setBuffer:bHash[slot] offset:0 atIndex:6];
+
+            uint32_t tg_size = threadgroup;
+            if (tg_size > batch) tg_size = batch;
+            MTLSize grid = MTLSizeMake(batch, 1, 1);
+            MTLSize tg   = MTLSizeMake(tg_size, 1, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+            [enc endEncoding];
+            [cb commit];
+
+            committed += batch;
+
+            // After committing the new CB, drain the *previous* one. This
+            // keeps two CBs in flight and means the GPU is processing while
+            // the host is computing the next dispatch's parameters.
+            if (prev_cb) {
+                [prev_cb waitUntilCompleted];
+                done += prev_batch;
+                if (*(uint32_t*)bFlag[prev_slot].contents) {
+                    found = true;
+                    found_nonce = *(uint32_t*)bNon[prev_slot].contents;
+                    memcpy(found_hash, bHash[prev_slot].contents, 32);
+                    [cb waitUntilCompleted];      // don't leave the new one dangling
+                    done += batch;
+                    prev_cb = nil;
+                    break;
+                }
+            }
+
+            prev_cb = cb;
+            prev_slot = slot;
+            prev_batch = batch;
+            slot = 1 - slot;
+        }
+
+        if (!found && prev_cb) {
+            [prev_cb waitUntilCompleted];
+            done += prev_batch;
+            if (*(uint32_t*)bFlag[prev_slot].contents) {
+                found = true;
+                found_nonce = *(uint32_t*)bNon[prev_slot].contents;
+                memcpy(found_hash, bHash[prev_slot].contents, 32);
+            }
+        }
+
+        double dt = monotime() - t0;
+        uint64_t hps = dt > 0 ? (uint64_t)((double)done / dt) : 0;
+        if (found) {
+            char hexHash[65]; hexHash[64] = 0;
+            for (int i = 0; i < 8; i++) snprintf(hexHash + i*8, 9, "%08x", found_hash[i]);
+            printf("{\"found\": true, \"nonce\": %u, \"hash\": \"%s\","
+                   " \"checked\": %llu, \"elapsed_ms\": %.3f, \"hashrate\": %llu}\n",
+                   found_nonce, hexHash,
+                   (unsigned long long)done, dt * 1000.0,
+                   (unsigned long long)hps);
+        } else {
+            printf("{\"found\": false, \"checked\": %llu, \"elapsed_ms\": %.3f, \"hashrate\": %llu}\n",
+                   (unsigned long long)done, dt * 1000.0, (unsigned long long)hps);
+        }
+        fflush(stdout);
+    };
+
+    // -----------------------------------------------------------------------
+    // Persistent mode: one job per stdin line, one result per stdout line.
+    // -----------------------------------------------------------------------
+    if (persistent) {
+        char *line = NULL;
+        size_t cap = 0;
+        ssize_t n;
+        while ((n = getline(&line, &cap, stdin)) > 0) {
+            @autoreleasepool {
+                NSData *d = [NSData dataWithBytes:line length:(NSUInteger)n];
+                NSError *jerr = nil;
+                id parsed = [NSJSONSerialization JSONObjectWithData:d options:0 error:&jerr];
+                if (![parsed isKindOfClass:[NSDictionary class]]) {
+                    printf("{\"error\": \"bad_json\"}\n"); fflush(stdout); continue;
+                }
+                NSDictionary *job = (NSDictionary *)parsed;
+                id hp = job[@"header_prefix"];
+                id tg = job[@"target"];
+                id sn = job[@"start_nonce"];
+                id cn = job[@"count"];
+                if (![hp isKindOfClass:[NSString class]] ||
+                    ![tg isKindOfClass:[NSString class]] ||
+                    ![sn isKindOfClass:[NSNumber class]] ||
+                    ![cn isKindOfClass:[NSNumber class]]) {
+                    printf("{\"error\": \"missing_fields\"}\n"); fflush(stdout); continue;
+                }
+                uint8_t header[80], target[32];
+                if (parseHex([(NSString*)hp UTF8String], header, 80) != 0 ||
+                    parseHex([(NSString*)tg UTF8String], target, 32) != 0) {
+                    printf("{\"error\": \"bad_hex\"}\n"); fflush(stdout); continue;
+                }
+                uint32_t sNonce = [(NSNumber*)sn unsignedIntValue];
+                uint64_t count  = [(NSNumber*)cn unsignedLongLongValue];
+                if (count == 0) {
+                    printf("{\"error\": \"zero_count\"}\n"); fflush(stdout); continue;
+                }
+                run_search(header, target, sNonce, count);
+            }
+        }
+        free(line);
+        return 0;
+    }
+
+    // -----------------------------------------------------------------------
+    // One-shot mode (back-compat with smoke tests / manual invocations).
+    // -----------------------------------------------------------------------
+    if (!hexHeader || !hexTarget) {
+        fprintf(stderr,
+                "metal_nonce_finder: --header-prefix and --target are required "
+                "(or use --persistent)\n");
+        return 2;
+    }
+    uint8_t header[80];
+    if (parseHex(hexHeader, header, 80) != 0) {
+        fprintf(stderr, "metal_nonce_finder: bad --header-prefix (need 160 hex chars)\n");
+        return 2;
+    }
+    uint8_t target[32];
+    if (parseHex(hexTarget, target, 32) != 0) {
+        fprintf(stderr, "metal_nonce_finder: bad --target (need 64 hex chars)\n");
+        return 2;
+    }
+    run_search(header, target, startNonce, totalCount);
     return 0;
 }
 }

@@ -10,8 +10,19 @@ private testnets, …).
 ## Highlights
 
 - **Metal compute kernel** (`src/metal_nonce_finder.mm`) — runtime-compiled
-  SHA-256d nonce search. ~180–250 MH/s on a base M2 (10-core GPU);
-  ~400–800 MH/s estimated on M2 Pro / Max.
+  SHA-256d nonce search. ~180 MH/s sustained on a base M2 (10-core GPU);
+  ~400-800 MH/s estimated on M2 Pro / Max.
+- **Zero-knob auto-tuning for any M-series chip.** GPU core count is read
+  from IOKit (`AGXAccelerator/gpu-core-count`); threadgroup defaults to the
+  Metal pipeline's `maxTotalThreadsPerThreadgroup`; per-dispatch is sized
+  from the core count; the Python driver adapts batch size to the observed
+  hashrate. M1 / M2 / M3 / M4 base / Pro / Max / Ultra all "just work" with
+  no chip-model parameter.
+- **Persistent GPU helper.** `metal_nonce_finder --persistent` reads JSON
+  jobs from stdin so the Metal shader is compiled exactly once per mining
+  session instead of per batch (~0.5 s saved every batch). Two command
+  buffers are kept in flight to keep the GPU saturated while the host
+  prepares the next dispatch.
 - **Stratum v1 pool client** (`src/stratum_miner.py`) — Python stdlib only
   (no `pip install`), auto-reconnect with backoff, share verify before submit.
 - **GBT solo client** (`src/gbt_miner.py`) — same GPU helper, talks to any
@@ -81,17 +92,25 @@ python3 src/gbt_miner.py \
     --gpu --gpu-binary src/metal_nonce_finder
 ```
 
-## Tuning
+## Tuning (you usually don't need to)
 
-Both the Stratum and solo paths accept the same GPU knobs:
+All GPU knobs default to `0` (auto). Both miners share the same flags:
 
-| Flag | Default | Effect |
+| Flag | Default (`0` = auto) | What auto does |
 |---|---|---|
-| `--gpu-batch` | `1<<27` (128M) pool / `1<<28` (256M) solo | Nonces per GPU subprocess call. Larger = better throughput, slower tip-change response. |
-| `--gpu-per-dispatch` | `1<<24` (16M) | Single-dispatch size. |
-| `--gpu-threadgroup` | `256` | Threads per Metal threadgroup. 256 is best on most Apple GPUs. |
+| `--gpu-batch` | `0` | Adapts toward `--gpu-target-seconds` of GPU work using the observed hashrate. |
+| `--gpu-target-seconds` | `1.0` (pool) / `2.0` (solo) | Smaller = faster job-switch latency; larger = lower per-batch overhead. |
+| `--gpu-per-dispatch` | `0` | Scales with detected GPU core count (≈ cores × 2 M, clamped to 4 M-64 M). |
+| `--gpu-threadgroup` | `0` | Uses the pipeline's `maxTotalThreadsPerThreadgroup` (576 for the SHA-256d kernel on M2). |
 
-Rule of thumb: aim for ~1 second per batch. At 500 MH/s that's `--gpu-batch 536870912` (512M).
+The Metal helper logs its choices on stderr at startup, e.g.:
+
+```
+[metal] device="Apple M2" gpu_cores=10 threadExecutionWidth=32 maxTPT=576 \
+        threadgroup=576 per_dispatch=20971520 (20.0M) [auto]
+```
+
+Pass any flag a positive integer to pin it; pass `0` to go back to auto.
 
 ## How it works
 
@@ -121,10 +140,11 @@ invalid block / share.
 apple-gpu-miner/
 ├── src/
 │   ├── metal_nonce_finder.mm   Apple Metal SHA-256d kernel + host driver (Objective-C++)
+│   ├── metal_helper.py         Persistent-helper subprocess wrapper (stdin/stdout JSON)
 │   ├── stratum_miner.py        Stratum v1 pool client
 │   └── gbt_miner.py            GBT solo client (any Bitcoin Core-compat node)
 ├── scripts/
-│   ├── build_metal.sh          clang++ + Foundation + Metal → src/metal_nonce_finder
+│   ├── build_metal.sh          clang++ + Foundation + Metal + IOKit → src/metal_nonce_finder
 │   ├── start_stratum.sh        One-line "mine to a pool" launcher
 │   └── start_solo.sh           One-line "mine to your bitcoind" launcher
 ├── tests/
@@ -135,9 +155,12 @@ apple-gpu-miner/
 
 ## Performance notes
 
-- Base M2 (10-core GPU), `--gpu-batch=256M`: **~180–250 MH/s** sustained.
-- M2 Pro / Max: estimated 2–4×.
-- First batch is ~0.5 s slower because Metal compiles the shader at runtime.
+- Base M2 (10-core GPU), zero tuning: **~178-180 MH/s** sustained
+  (pipelined dispatch, threadgroup auto-tuned to 576).
+- M2 Pro / Max: estimated 2-4× the base M2 (scales with GPU cores).
+- First batch is ~0.5 s slower while Metal compiles the shader; with the
+  persistent helper that cost is paid **once per mining session**, not per
+  batch as in the previous fork-and-exec design.
 - Sustained mining will throttle without active cooling. A small fan helps.
 
 ## Disclaimers
