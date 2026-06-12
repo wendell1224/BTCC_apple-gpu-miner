@@ -149,6 +149,112 @@ job 切换更灵敏：
 ./scripts/start_stratum.sh cc1q....  --gpu-target-seconds 0.3
 ```
 
+## 后台运行 / 长时间挂机
+
+矿工是个长期运行的进程，关掉终端 / SSH 断线 / 笔记本休眠都会让它停下来。
+下面几种姿势按"简单 → 省心"递进，挑一个用就行。
+
+### 方案一：`nohup` + 日志文件（最简单）
+
+把日志重定向到文件，进程脱离当前终端在后台跑：
+
+```bash
+# 1. 启动（关掉终端也不会被 SIGHUP 杀掉）
+nohup ./scripts/start_stratum.sh cc1q.... > miner.log 2>&1 &
+echo $! > miner.pid       # 记下 PID 方便后面停
+
+# 2. 看实时日志
+tail -f miner.log
+
+# 3. 停掉
+kill "$(cat miner.pid)"
+# 兜底：按命令名一把杀
+pkill -f stratum_miner.py
+pkill -f metal_nonce_finder
+```
+
+### 方案二：`caffeinate` 防睡眠（笔记本必备）
+
+macOS 笔记本合盖 / 没插电时默认会睡，一睡 GPU 就停。用 `caffeinate -i`
+（`-i` = 防止系统空闲休眠）把矿工包起来：
+
+```bash
+nohup caffeinate -i ./scripts/start_stratum.sh cc1q.... > miner.log 2>&1 &
+echo $! > miner.pid
+```
+
+> `caffeinate -i` 只阻止"空闲休眠"，**合盖还是会睡**。想合盖也跑：在
+> "系统设置 → 显示器 → 高级 → 合盖时阻止 Mac 自动进入睡眠"打勾，或者用
+> `caffeinate -dis`（外接显示器接电时才生效）。
+
+### 方案三：`tmux` / `screen`（SSH 远程挖最舒服）
+
+通过 SSH 跑矿机时强烈推荐——断线不会丢进程，回头还能 attach 看实时输出。
+
+```bash
+# 装一次（自带的话跳过）
+brew install tmux
+
+# 新建一个 tmux session
+tmux new -s miner
+# 在 tmux 里启动矿工（前台跑就行，日志直接打屏幕上）
+caffeinate -i ./scripts/start_stratum.sh cc1q....
+
+# 按 Ctrl-b 然后按 d，detach 出来，进程继续跑
+# 再回来看：
+tmux attach -t miner
+# 列出所有 session：
+tmux ls
+```
+
+### 方案四：开机自启（launchd，进阶）
+
+想让矿工开机就跑、崩了自动拉起，写一个 launchd plist。把下面内容存为
+`~/Library/LaunchAgents/com.local.apple-gpu-miner.plist`，把 `<address>`
+和路径改成你自己的：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>            <string>com.local.apple-gpu-miner</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>/Users/YOU/Documents/apple-gpu-miner/scripts/start_stratum.sh</string>
+        <string>cc1q....</string>
+    </array>
+    <key>WorkingDirectory</key> <string>/Users/YOU/Documents/apple-gpu-miner</string>
+    <key>RunAtLoad</key>        <true/>
+    <key>KeepAlive</key>        <true/>
+    <key>StandardOutPath</key>  <string>/tmp/apple-gpu-miner.log</string>
+    <key>StandardErrorPath</key><string>/tmp/apple-gpu-miner.log</string>
+</dict>
+</plist>
+```
+
+加载 / 卸载 / 看状态：
+
+```bash
+launchctl load   ~/Library/LaunchAgents/com.local.apple-gpu-miner.plist
+launchctl list | grep apple-gpu-miner
+launchctl unload ~/Library/LaunchAgents/com.local.apple-gpu-miner.plist
+tail -f /tmp/apple-gpu-miner.log
+```
+
+### 检查矿工还活着没
+
+```bash
+# 进程在不在
+pgrep -fl stratum_miner.py
+
+# 算力还在不在（看 [stratum] mining ~XXX MH/s 这行的更新时间）
+tail -n 20 miner.log
+```
+
 ## 工作原理
 
 Metal 内核 (`src/metal_nonce_finder.mm`) 在 CPU 端预算 80 字节区块头前 64 字节的 SHA-256 midstate，然后每个 GPU 线程：
