@@ -56,8 +56,6 @@ python3 tests/smoke_metal_nonce_finder.py     # 期望 4 个 [OK]
 # 默认矿池 + worker = 主机名
 ./scripts/start_stratum.sh cc1q....
 
-# 默认矿池 + 自定义 worker
-./scripts/start_stratum.sh cc1q....  m2-laptop
 
 # 默认 worker + 自定义矿池
 ./scripts/start_stratum.sh cc1q....  stratum+tcp://your.pool:3333
