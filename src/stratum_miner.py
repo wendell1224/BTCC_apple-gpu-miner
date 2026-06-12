@@ -88,13 +88,60 @@ class PoolState:
     new_job_event: threading.Event = field(default_factory=threading.Event)
 
 
+def _connect_socket(host: str, port: int, *,
+                    timeout: float, prefer_ipv6: bool = False) -> socket.socket:
+    """Resolve `host` and connect, IPv4-first by default.
+
+    `socket.create_connection` walks `getaddrinfo` results in order, so on
+    hosts whose AAAA record points to an unreachable IPv6 address (broken
+    home networks, ISPs without v6, locked-down NATs, etc.) Python will
+    block for `timeout` seconds before falling back to IPv4 — the classic
+    "telnet works but Python hangs" symptom that affects almost every
+    Python-based stratum miner.
+
+    We instead always try every IPv4 address before any IPv6 address, and
+    log each failed attempt so the user can see what actually went wrong.
+    Pass `prefer_ipv6=True` to flip the order if you really do want IPv6
+    first.
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise OSError(f"DNS lookup failed for {host}: {e}") from e
+
+    v4 = [(fam, sa) for (fam, _t, _p, _c, sa) in infos if fam == socket.AF_INET]
+    v6 = [(fam, sa) for (fam, _t, _p, _c, sa) in infos if fam == socket.AF_INET6]
+    candidates = (v6 + v4) if prefer_ipv6 else (v4 + v6)
+    if not candidates:
+        raise OSError(f"no addresses resolved for {host}:{port}")
+
+    last_err: Optional[Exception] = None
+    for fam, sa in candidates:
+        sock = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(sa)
+            return sock
+        except OSError as e:
+            last_err = e
+            try: sock.close()
+            except Exception: pass
+            kind = "IPv6" if fam == socket.AF_INET6 else "IPv4"
+            print(f"[stratum] {kind} connect to {sa} failed: {e}", flush=True)
+            continue
+    assert last_err is not None
+    raise last_err
+
+
 class StratumClient:
     """Line-oriented JSON-RPC over TCP (Stratum v1)."""
 
-    def __init__(self, host: str, port: int, *, timeout: float = 60.0):
+    def __init__(self, host: str, port: int, *,
+                 timeout: float = 30.0, prefer_ipv6: bool = False):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.prefer_ipv6 = prefer_ipv6
         self.sock: Optional[socket.socket] = None
         self._recv_buf = b""
         self._next_id = 1
@@ -106,7 +153,10 @@ class StratumClient:
         self.connected = False
 
     def connect(self) -> None:
-        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.sock = _connect_socket(
+            self.host, self.port,
+            timeout=self.timeout, prefer_ipv6=self.prefer_ipv6,
+        )
         self.sock.settimeout(None)
         # Enable TCP keepalive so dead connections are detected within ~1 minute
         # instead of waiting for the kernel default (~2 hours on macOS).
@@ -303,7 +353,11 @@ def mine_session(args: argparse.Namespace, host: str, port: int,
     Raises KeyboardInterrupt to bubble up Ctrl-C."""
     print(f"[stratum] connecting to {host}:{port} as {args.user!r} ...", flush=True)
 
-    client = StratumClient(host, port, timeout=60)
+    client = StratumClient(
+        host, port,
+        timeout=float(args.connect_timeout),
+        prefer_ipv6=bool(args.prefer_ipv6),
+    )
     client.connect()
     state = client.state
 
@@ -610,6 +664,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--user", required=True,
                    help="Pool username, typically <wallet_address>.<worker_name>")
     p.add_argument("--pass", dest="pass_", default="x", help="Pool password (often ignored)")
+
+    # Connection knobs. By default we try IPv4 first because many home /
+    # mobile networks publish broken AAAA records that make Python hang
+    # while plain telnet (which usually picks one address) connects fine.
+    p.add_argument("--prefer-ipv6", action="store_true",
+                   help="Try IPv6 addresses before IPv4 (default: IPv4 first).")
+    p.add_argument("--connect-timeout", type=float, default=15.0,
+                   help="Per-address TCP connect timeout in seconds. "
+                        "Lower this if your IPv6 path is broken; the miner "
+                        "will fall back to IPv4 sooner.")
 
     default_gpu_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metal_nonce_finder")
     p.add_argument("--gpu", action="store_true",

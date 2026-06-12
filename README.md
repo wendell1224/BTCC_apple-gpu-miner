@@ -148,6 +148,66 @@ job 切换更灵敏：
 ./scripts/start_stratum.sh cc1q....  --gpu-target-seconds 0.3
 ```
 
+## 连接故障排查
+
+> 「`telnet` / `nc` 连得上矿池，但跑项目报 connection error / 一直卡在 connecting」？
+> 这是 Python 矿工最常见的"IPv6 优先卡死"问题。
+
+### 一句话原因
+
+`telnet` 通常只挑解析到的第一个地址用（多半是 IPv4），而 Python 的
+`socket.create_connection` 会**按 `getaddrinfo` 返回顺序逐个试**。如果矿池
+有 AAAA 记录但你这边的 IPv6 路径不通（家用路由没开 v6、运营商不发 v6、
+公司 NAT 挡 v6），Python 会先在 IPv6 上挂满超时再回退到 IPv4，对外表现
+就是"连接失败 / 一直 connecting"。
+
+### 现版本的处理
+
+从 v0.2 起项目**默认 IPv4 优先**，并且每次连接尝试都会打印一行日志，
+所以正常情况下你不会再遇到这个问题。如果你看到的日志类似：
+
+```
+[stratum] IPv4 connect to ('1.2.3.4', 63101) failed: [Errno 65] No route to host
+[stratum] IPv6 connect to ('2001:...', 63101) failed: [Errno 65] No route to host
+```
+
+说明 **v4 / v6 都不通**，是真的网络 / 矿池问题。这时按下面顺序排查：
+
+```bash
+# 1. v4 / v6 分别用 nc 测，确认到底哪条路径通
+nc -4 -vz pool.btc-classic.org 63101    # 应该秒通
+nc -6 -vz pool.btc-classic.org 63101    # 这条不通也无所谓
+
+# 2. 看 DNS 解析
+python3 -c "import socket; [print(a[4]) for a in socket.getaddrinfo('pool.btc-classic.org', 63101, type=socket.SOCK_STREAM)]"
+
+# 3. 跑矿工时把详细错误打出来
+./scripts/start_stratum.sh <地址> 2>&1 | tee miner.log
+grep -E '\[stratum\]|Error' miner.log
+```
+
+### 常见错误对照表
+
+| 日志关键词 | 真实原因 | 怎么修 |
+|---|---|---|
+| `IPv6 connect to ... failed` 后接 `IPv4 connect ... succeeded` | IPv6 路径不通，已自动回退 | 不用管，能跑就行 |
+| `connection error: [Errno 61] Connection refused` | 端口错 / 矿池真没开 | 检查 `--url` 端口号 |
+| `connection error: [Errno 65] No route to host` | 防火墙 / 公司 NAT 挡 | 换网络，或矿池换 443 等常用端口 |
+| `bad JSON line: b'\x16\x03\x01...'` | 矿池要求 SSL/TLS | 项目目前**不支持 TLS**，换 plain TCP 端口 |
+| `subscribe failed: ...` | 矿池协议变种 | 看 error 详细字段 |
+| `authorize_failed` | 用户名 / 钱包地址非法 | 确认地址前缀（BTCC = `cc1...`），worker 名只用字母数字横线 |
+| `socket recv error: ... timed out` | 连上但矿池没 push job | 多半是地址前缀对不上链 |
+
+### 强制 IPv6 优先 / 调连接超时
+
+```bash
+# 我就要用 IPv6
+./scripts/start_stratum.sh <地址> --prefer-ipv6
+
+# IPv6 路径慢，让 v4 fallback 来得更快（默认 15s）
+./scripts/start_stratum.sh <地址> --connect-timeout 5
+```
+
 ## 后台运行 / 长时间挂机
 
 矿工是个长期运行的进程，关掉终端 / SSH 断线 / 笔记本休眠都会让它停下来。
