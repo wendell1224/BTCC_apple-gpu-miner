@@ -38,54 +38,89 @@ cd apple-gpu-miner
 ./scripts/build_metal.sh
 
 # 2. 可选：跑一次冒烟测试，验证 GPU == CPU
-python3 tests/smoke_metal_nonce_finder.py    # 期望 4 个 [OK]
+python3 tests/smoke_metal_nonce_finder.py     # 期望 4 个 [OK]
 
 # 3. 开挖
-./scripts/start_stratum.sh <你的收款地址>
-
-# 自定义矿工名 / 矿池：
-./scripts/start_stratum.sh <你的收款地址>  stratum+tcp://your.pool:3333
+./scripts/start_stratum.sh <你的BTCC收款地址>
 ```
 
-默认矿池是 `stratum+tcp://btccmine.top:3333`（Bitcoin-Classic）。
-想换矿池可以传第三个参数，或者用 `POOL_URL` 环境变量。
+默认矿池：`stratum+tcp://pool.btc-classic.org:63101`（Bitcoin-Classic 当前推荐公矿池）。
 
+### `start_stratum.sh` 的几种调用方式
 
-现在最新的公矿地址是 `stratum+tcp://pool.btc-classic.org:63101 `，建议使用这个
+脚本会自动识别哪个参数是 worker、哪个是矿池 URL（以 `stratum` 开头就是 URL）；
+任何 `--` 开头的参数都会原样转发给 `stratum_miner.py`。
 
-典型日志：
+```bash
+# 默认矿池 + worker = 主机名
+./scripts/start_stratum.sh cc1q....
+
+# 默认矿池 + 自定义 worker
+./scripts/start_stratum.sh cc1q....  m2-laptop
+
+# 默认 worker + 自定义矿池
+./scripts/start_stratum.sh cc1q....  stratum+tcp://your.pool:3333
+
+# worker + 矿池都自定义
+./scripts/start_stratum.sh cc1q....  m2-laptop  stratum+tcp://your.pool:3333
+
+# 顺手带上 GPU/网络等额外参数（透传给 stratum_miner.py）
+./scripts/start_stratum.sh cc1q....  --gpu-target-seconds 0.3
+
+# 用环境变量也行
+POOL_URL=stratum+tcp://your.pool:3333 ./scripts/start_stratum.sh cc1q....
+```
+
+### 直接调 `stratum_miner.py`（不走脚本）
+
+```bash
+python3 src/stratum_miner.py \
+    --url  stratum+tcp://pool.btc-classic.org:63101 \
+    --user cc1q....your_btcc_address.m2-laptop \
+    --pass x \
+    --gpu --gpu-binary src/metal_nonce_finder
+```
+
+### 典型日志
 
 ```
-[stratum] connecting to btccmine.top:3333 ...
+[stratum] connecting to pool.btc-classic.org:63101 as 'cc1q....m2-test' ...
+[metal] device="Apple M2" gpu_cores=10 threadExecutionWidth=32 maxTPT=576 threadgroup=576 per_dispatch=20971520 (20.0M) [auto]
 [stratum] subscribed: extranonce1=000001b4 extranonce2_size=4
 [stratum] set_difficulty=2.0
 [stratum] new job 0000000e prev=...
 [stratum] authorized as 'cc1q....m2-test'
-[stratum] mining ~90 MH/s  diff=2.0  shares=0
+[stratum] mining ~178.5 MH/s  diff=2.0  shares=0
 [stratum] SHARE ACCEPTED  job=0000000e nonce=fdb4fd65 hash=00000000303a9fb3...
 ```
 
-`SHARE ACCEPTED` 就代表你的算力已经被矿池记录、参与分账。
+`SHARE ACCEPTED` 就代表你的算力已经被矿池记录、参与分账。第一行 `[metal] device=...`
+是 GPU helper 启动时报告的自动检测结果，看一眼可以确认 threadgroup / per-dispatch
+被自动设成了合理值。
 
 ## Solo 模式（连自己的节点）
 
 你需要先自己跑一个 Bitcoin Core 兼容的节点（`bitcoind` / `btccd` / …），然后：
 
 ```bash
-RPCHOST=127.0.0.1 RPCPORT=8332 RPCUSER=user RPCPASSWORD=pass \
-    ADDRESS=bc1qyouraddress \
+RPCHOST=127.0.0.1 RPCPORT=28476 RPCUSER=user RPCPASSWORD=pass \
+    ADDRESS=cc1qyouraddress \
     ./scripts/start_solo.sh
 ```
 
-默认值：`127.0.0.1:28476`（BTCC 默认 RPC 端口）、用户 `user`、密码 `pass`。
+`start_solo.sh` 默认值（来自环境变量）：
+- `RPCHOST=127.0.0.1`
+- `RPCPORT=28476`（BTCC 默认 RPC 端口；BTC 主网用 `8332`）
+- `RPCUSER=user` / `RPCPASSWORD=pass`
+- `ADDRESS` 留空时会调节点的 `getnewaddress` 自动建一个
 
 或者直接调 `gbt_miner.py`：
 
 ```bash
 python3 src/gbt_miner.py \
-    --rpchost 127.0.0.1 --rpcport 8332 \
+    --rpchost 127.0.0.1 --rpcport 28476 \
     --rpcuser user --rpcpassword pass \
-    --address bc1qyouraddress \
+    --address cc1qyouraddress \
     --gpu --gpu-binary src/metal_nonce_finder
 ```
 
@@ -93,21 +128,26 @@ python3 src/gbt_miner.py \
 
 默认情况下所有 GPU 参数都是 `auto`：
 
-| 参数 | 默认（0 = auto） | 自动行为 |
+| 参数 | 默认（`0` = auto） | 自动行为 |
 |---|---|---|
 | `--gpu-batch` | `0` | 按观测算力调整，让单次搜索约 `--gpu-target-seconds` 秒 |
 | `--gpu-target-seconds` | stratum `1.0` / solo `2.0` | 越小切换 job 越快，越大开销摊得越薄 |
-| `--gpu-per-dispatch` | `0` | 按 IOKit 读到的 GPU 核数缩放（基本上 GPU\_cores × 2 M，4 M~64 M 之间） |
-| `--gpu-threadgroup` | `0` | 用 `maxTotalThreadsPerThreadgroup`（M2 上 SHA-256d 内核 = 576） |
+| `--gpu-per-dispatch` | `0` | 按 IOKit 读到的 GPU 核数缩放（≈ `cores × 2 M`，clamp 到 4 M~64 M） |
+| `--gpu-threadgroup` | `0` | 用 Metal pipeline 自报的 `maxTotalThreadsPerThreadgroup`（M2 上 SHA-256d 内核 = 576） |
 
-启动时会在 stderr 上打印一行检测结果，例如：
+启动时 stderr 会打印一行实际选用的值，方便确认：
 
 ```
 [metal] device="Apple M2" gpu_cores=10 threadExecutionWidth=32 maxTPT=576 \
         threadgroup=576 per_dispatch=20971520 (20.0M) [auto]
 ```
 
-如果你确实想手工锁定，所有参数都接受正整数；传 `0` 就是恢复 auto。
+如果你确实想手工锁定，所有参数都接受正整数；传 `0` 就回到 auto。例如想让
+job 切换更灵敏：
+
+```bash
+./scripts/start_stratum.sh cc1q....  --gpu-target-seconds 0.3
+```
 
 ## 工作原理
 
@@ -158,7 +198,9 @@ apple-gpu-miner/
 - 在 Bitcoin 主网上用消费级硬件 solo 挖矿**完全不经济**——~500 MH/s 期望命中时间是 100 年级别。
   请连矿池，或者去挖低难度的 altchain / 私有链。
 - 本软件按 MIT 协议提供，**不附带任何担保**。挖矿在某些司法辖区会涉及税务和合规问题，请自查。
-- 默认矿池地址 `btccmine.top` 仅适用于 Bitcoin-Classic (BTCC) 链。**不能**把 BTC 钱包地址塞给它，反过来也不行——地址格式不兼容。
+- 默认矿池 `pool.btc-classic.org:63101` 仅适用于 Bitcoin-Classic (BTCC) 链。
+  收款地址必须是 BTCC 的 `cc1...` 前缀——**不能**把 BTC `bc1...` 地址塞给它，
+  反过来也不行，地址格式不兼容。挖 BTC 主网请自己换 `--url` / `--user`。
 
 ## 致谢
 

@@ -2,7 +2,7 @@
 """
 Stratum v1 SHA-256d pool miner.
 
-Connects to a Stratum v1 mining pool (e.g. stratum+tcp://btccmine.top:3333),
+Connects to a Stratum v1 mining pool (e.g. stratum+tcp://pool.btc-classic.org:63101),
 authenticates, receives mining jobs, drives the local Metal GPU helper
 (or Python CPU) to find shares, and submits them back.
 
@@ -13,12 +13,12 @@ wallet address you provided in the username.
 Python stdlib only (socket + threading + json + struct + hashlib + subprocess).
 
 Usage:
-  python3 miner/stratum_miner.py \\
-      --url stratum+tcp://btccmine.top:3333 \\
+  python3 src/stratum_miner.py \\
+      --url stratum+tcp://pool.btc-classic.org:63101 \\
       --user cc1q....your_btcc_address.worker1 \\
       --pass x \\
       --gpu \\
-      --gpu-binary miner/metal_nonce_finder
+      --gpu-binary src/metal_nonce_finder
 """
 
 from __future__ import annotations
@@ -606,7 +606,7 @@ def mine(args: argparse.Namespace) -> None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stratum v1 SHA-256d pool miner")
     p.add_argument("--url", required=True,
-                   help="Pool URL, e.g. stratum+tcp://btccmine.top:3333")
+                   help="Pool URL, e.g. stratum+tcp://pool.btc-classic.org:63101")
     p.add_argument("--user", required=True,
                    help="Pool username, typically <wallet_address>.<worker_name>")
     p.add_argument("--pass", dest="pass_", default="x", help="Pool password (often ignored)")

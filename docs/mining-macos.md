@@ -63,18 +63,24 @@ python3 tests/smoke_metal_nonce_finder.py
 ```
 
 不需要 `bitcoind`，不需要同步区块。看到 `SHARE ACCEPTED` 就代表算力已经被矿池记录。
+默认矿池：`stratum+tcp://pool.btc-classic.org:63101`。
 
-可选参数：
+`start_stratum.sh` 的参数顺序是 `<地址> [worker | URL] [URL]`，脚本会按
+"以 `stratum` 开头的就是 URL，否则就是 worker 名" 自动判别；任何 `--` 开头的
+参数会原样转发给 `stratum_miner.py`：
 
 ```bash
 # 自定义矿工名（默认是机器主机名）
 ./scripts/start_stratum.sh cc1q.... m2-laptop
 
-# 切到自己的矿池
+# 默认 worker + 自定义矿池
+./scripts/start_stratum.sh cc1q.... stratum+tcp://your.pool:3333
+
+# 同时自定义 worker 和矿池
 ./scripts/start_stratum.sh cc1q.... m2-laptop stratum+tcp://your.pool:3333
 
-# 调 GPU batch
-./scripts/start_stratum.sh cc1q.... m2-laptop "" --gpu-batch 67108864
+# 直接透传 GPU 调参
+./scripts/start_stratum.sh cc1q.... --gpu-target-seconds 0.3
 ```
 
 ### 3.3 连本地节点 solo 挖
@@ -82,20 +88,21 @@ python3 tests/smoke_metal_nonce_finder.py
 先把 Bitcoin Core 兼容的节点跑起来（这部分不在本项目范围）。然后：
 
 ```bash
-RPCHOST=127.0.0.1 RPCPORT=8332 RPCUSER=user RPCPASSWORD=pass \
-    ADDRESS=bc1qyouraddress \
+RPCHOST=127.0.0.1 RPCPORT=28476 RPCUSER=user RPCPASSWORD=pass \
+    ADDRESS=cc1qyouraddress \
     ./scripts/start_solo.sh
 ```
+
+`start_solo.sh` 默认 RPC 端口 `28476`（BTCC）；BTC 主网用 `8332`。
 
 或直接调 Python：
 
 ```bash
 python3 src/gbt_miner.py \
-    --rpchost 127.0.0.1 --rpcport 8332 \
+    --rpchost 127.0.0.1 --rpcport 28476 \
     --rpcuser user --rpcpassword pass \
-    --address bc1qyouraddress \
-    --gpu --gpu-binary src/metal_nonce_finder \
-    --gpu-batch $((1<<28))
+    --address cc1qyouraddress \
+    --gpu --gpu-binary src/metal_nonce_finder
 ```
 
 ---
@@ -131,10 +138,10 @@ GPU 三个参数全部默认 `0 = auto`，**M 系列芯片不需要指定型号*
 
 ```bash
 # 手动锁 batch=128M（不再自动调整）
-./scripts/start_stratum.sh cc1q.... m2-test "" --gpu-batch 134217728
+./scripts/start_stratum.sh cc1q.... --gpu-batch 134217728
 
 # 让一次 batch 大约 0.3 秒（job 切换更快）
-./scripts/start_stratum.sh cc1q.... m2-test "" --gpu-target-seconds 0.3
+./scripts/start_stratum.sh cc1q.... --gpu-target-seconds 0.3
 ```
 
 ### 5.1 CPU 后端

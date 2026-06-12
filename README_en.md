@@ -46,28 +46,67 @@ cd apple-gpu-miner
 ./scripts/build_metal.sh
 
 # 2. (Optional) Verify GPU == CPU
-python3 tests/smoke_metal_nonce_finder.py    # expect 4x [OK]
+python3 tests/smoke_metal_nonce_finder.py     # expect 4x [OK]
 
 # 3. Mine
-./scripts/start_stratum.sh <YOUR_PAYOUT_ADDRESS>
-# Custom worker name / pool:
-./scripts/start_stratum.sh <ADDRESS> m2-laptop stratum+tcp://your.pool:3333
+./scripts/start_stratum.sh <YOUR_BTCC_ADDRESS>
 ```
 
-The default pool is `stratum+tcp://btccmine.top:3333` (Bitcoin-Classic).
-Override with the third positional arg or the `POOL_URL` env var.
+Default pool: `stratum+tcp://pool.btc-classic.org:63101` (the current
+recommended Bitcoin-Classic public pool).
 
-Typical log:
+### `start_stratum.sh` calling forms
+
+The script auto-detects which trailing positional is the worker name and
+which is the URL (anything starting with `stratum` is the URL). Anything
+starting with `--` is forwarded to `stratum_miner.py` verbatim.
+
+```bash
+# Default pool, worker = hostname
+./scripts/start_stratum.sh cc1q....
+
+# Default pool, custom worker
+./scripts/start_stratum.sh cc1q....  m2-laptop
+
+# Default worker, custom pool
+./scripts/start_stratum.sh cc1q....  stratum+tcp://your.pool:3333
+
+# Both custom
+./scripts/start_stratum.sh cc1q....  m2-laptop  stratum+tcp://your.pool:3333
+
+# Forward extra GPU/network flags
+./scripts/start_stratum.sh cc1q....  --gpu-target-seconds 0.3
+
+# Or use the env var
+POOL_URL=stratum+tcp://your.pool:3333 ./scripts/start_stratum.sh cc1q....
+```
+
+### Calling `stratum_miner.py` directly
+
+```bash
+python3 src/stratum_miner.py \
+    --url  stratum+tcp://pool.btc-classic.org:63101 \
+    --user cc1q....your_btcc_address.m2-laptop \
+    --pass x \
+    --gpu --gpu-binary src/metal_nonce_finder
+```
+
+### Typical log
 
 ```
-[stratum] connecting to btccmine.top:3333 ...
+[stratum] connecting to pool.btc-classic.org:63101 as 'cc1q....m2-test' ...
+[metal] device="Apple M2" gpu_cores=10 threadExecutionWidth=32 maxTPT=576 threadgroup=576 per_dispatch=20971520 (20.0M) [auto]
 [stratum] subscribed: extranonce1=000001b4 extranonce2_size=4
 [stratum] set_difficulty=2.0
 [stratum] new job 0000000e prev=...
 [stratum] authorized as 'cc1q....m2-test'
-[stratum] mining ~90 MH/s  diff=2.0  shares=0
+[stratum] mining ~178.5 MH/s  diff=2.0  shares=0
 [stratum] SHARE ACCEPTED  job=0000000e nonce=fdb4fd65 hash=00000000303a9fb3...
 ```
+
+`SHARE ACCEPTED` means your hashrate is registered with the pool. The
+`[metal] device=...` line is the GPU helper's auto-tune report — a quick
+sanity check that the right threadgroup / per-dispatch were picked.
 
 ## Solo mining (against your own node)
 
@@ -75,20 +114,22 @@ Run any Bitcoin Core-compatible daemon (`bitcoind`, `btccd`, etc.) yourself,
 then point the helper at it:
 
 ```bash
-RPCHOST=127.0.0.1 RPCPORT=8332 RPCUSER=user RPCPASSWORD=pass \
-    ADDRESS=bc1qyourpayoutaddress \
+RPCHOST=127.0.0.1 RPCPORT=28476 RPCUSER=user RPCPASSWORD=pass \
+    ADDRESS=cc1qyourpayoutaddress \
     ./scripts/start_solo.sh
 ```
 
-Defaults: `127.0.0.1:28476` (BTCC default RPC port), user `user`, password `pass`.
+`start_solo.sh` defaults: `RPCHOST=127.0.0.1`, `RPCPORT=28476` (BTCC; use
+`8332` for BTC mainnet), `RPCUSER=user`, `RPCPASSWORD=pass`. If `ADDRESS`
+is empty the miner calls the node's `getnewaddress`.
 
 Or call `gbt_miner.py` directly:
 
 ```bash
 python3 src/gbt_miner.py \
-    --rpchost 127.0.0.1 --rpcport 8332 \
+    --rpchost 127.0.0.1 --rpcport 28476 \
     --rpcuser user --rpcpassword pass \
-    --address bc1qyouraddress \
+    --address cc1qyouraddress \
     --gpu --gpu-binary src/metal_nonce_finder
 ```
 
@@ -170,9 +211,10 @@ apple-gpu-miner/
   low-difficulty altchain / private network.
 - This software is provided "as is", under the MIT license. Mining
   cryptocurrency may have legal and tax implications in your jurisdiction.
-- The included default pool address (`btccmine.top`) is for the
-  Bitcoin-Classic (BTCC) chain only. Don't point a BTC wallet at it (and
-  vice-versa) — the address formats are incompatible.
+- The default pool `pool.btc-classic.org:63101` is the Bitcoin-Classic
+  (BTCC) chain only. Payout addresses must use the `cc1...` prefix. Don't
+  point a BTC `bc1...` wallet at it (and vice-versa) — the address formats
+  are incompatible. To mine BTC mainnet, override `--url` and `--user`.
 
 ## Acknowledgements
 
