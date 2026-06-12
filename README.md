@@ -45,6 +45,7 @@ python3 tests/smoke_metal_nonce_finder.py     # 期望 4 个 [OK]
 ```
 
 默认矿池：`stratum+tcp://pool.btc-classic.org:63101`（Bitcoin-Classic 当前推荐公矿池）。
+尽量指定矿池 `scripts/start_stratum.sh xxxx stratum+tcp://pool.btc-classic.org:63101`
 
 ### `start_stratum.sh` 的几种调用方式
 
