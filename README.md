@@ -164,6 +164,48 @@ apple-gpu-miner/
 
 代码从 [Bitcoin-Classic](https://github.com/bitcoin-classic/bitcoin-classic) 仓库中的 macOS GPU 挖矿组件抽取并通用化而来。Metal 内核的"midstate + 只跑 tail 第二次 compress"结构是十几年来 cgminer / bfgminer / cpuminer 一直在用的成熟模式。
 
+## 更新日志
+
+### 2026-06-12 — 释放全部 GPU 性能 / M 系列零调参
+
+针对 M 系列芯片完全自动调优，**不再需要指定芯片型号**。
+
+新增 / 改动：
+
+- **GPU 自动检测**：通过 IOKit (`AGXAccelerator/gpu-core-count`) 在运行时
+  读出 GPU 核数，per-dispatch 按核数自动缩放（基本上 `cores × 2 M`，clamp
+  到 4 M ~ 64 M）。M1 / M2 / M3 / M4 base / Pro / Max / Ultra 一份二进制
+  通吃。
+- **threadgroup 自动调优**：直接采用 Metal pipeline 自己报告的
+  `maxTotalThreadsPerThreadgroup`（M2 上 SHA-256d 内核 = 576），比旧版
+  写死的 256 在 M2 上多 ~3 MH/s。
+- **持久化 helper**（`metal_nonce_finder --persistent`）：从 stdin 读 JSON
+  任务、stdout 写 JSON 结果。Metal shader **整个挖矿会话只编译一次**
+  （~0.5 s），不再像旧版本每个 batch fork-exec 都付一次。
+- **双命令缓冲区流水线**：commit 完新 cb 再 wait 上一个，GPU 在 host 准备
+  下一批参数时不空转。
+- **Python 端自适应批量**：`--gpu-batch=0`（默认）时按观测算力把单次搜索
+  调成约 `--gpu-target-seconds` 秒（stratum 1.0 s / solo 2.0 s），新增
+  `--gpu-target-seconds` 参数控制延迟 / 吞吐权衡。
+- 所有 GPU 调参默认 `0 = auto`；想手动锁定就传正整数，传 `0` 就回到 auto。
+- 启动时 stderr 打印一行 `[metal] device=... gpu_cores=... threadgroup=...
+  per_dispatch=... [auto]`，方便确认自动选择是否合理。
+- 新文件 `src/metal_helper.py`：`MetalGpuHelper` 类，stratum 与 solo 共用
+  持久化 helper。
+- `scripts/build_metal.sh` 新增 `-framework IOKit` 链接。
+- 完整向后兼容：旧的一次性 CLI（`--header-prefix --target ...`）保留，
+  smoke test 不变。
+
+实测（M2 base，10 核 GPU，自动调参，无外部冷却）：
+
+```
+fresh auto-tune defaults: avg=179.2 MH/s  runs=['177.1', '179.3', '180.2', '179.6', '179.7']
+```
+
+### 之前的版本
+
+初始版本：Metal SHA-256d nonce 搜索 + Stratum v1 矿池客户端 + GBT solo 客户端。
+
 ## License
 
 MIT — 见 [LICENSE](LICENSE)。
