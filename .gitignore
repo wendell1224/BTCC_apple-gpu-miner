@@ -1,0 +1,19 @@
+# Build output (compiled Metal helper)
+src/metal_nonce_finder
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs / scratch
+*.log
+tmp/
