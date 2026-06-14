@@ -14,6 +14,7 @@
   GPU 核数，pipeline 自己挑 threadgroup（直接用 `maxTotalThreadsPerThreadgroup`）和
   per-dispatch 大小；Python 端按观测算力把每次搜索调成约 1 秒（stratum）/ 2 秒（solo）。
   M1 / M2 / M3 / M4 base / Pro / Max / Ultra 全部不需要手动写"我是哪颗芯片"。
+  Stratum 模式还会按芯片型号自动向矿池建议合适的 share difficulty。
 - **持久化 GPU helper**：`metal_nonce_finder --persistent` 读 stdin 上的 JSON 任务，
   Metal shader 只编译一次，避免每个 batch 都付 ~0.5 s 编译开销 + fork 开销。
   双命令缓冲区流水线让 GPU 在 host 准备下一个 dispatch 时不空转。
@@ -66,6 +67,12 @@ python3 tests/smoke_metal_nonce_finder.py     # 期望 4 个 [OK]
 # 顺手带上 GPU/网络等额外参数（透传给 stratum_miner.py）
 ./scripts/start_stratum.sh cc1q....  --gpu-target-seconds 0.3
 
+# 手动建议 share difficulty；不传时按芯片自动建议
+./scripts/start_stratum.sh cc1q....  --suggest-difficulty 16
+
+# 完全关闭建议，接受矿池默认 share difficulty
+./scripts/start_stratum.sh cc1q....  --suggest-difficulty 0
+
 # 用环境变量也行
 POOL_URL=stratum+tcp://your.pool:3333 ./scripts/start_stratum.sh cc1q....
 ```
@@ -77,6 +84,7 @@ python3 src/stratum_miner.py \
     --url  stratum+tcp://pool.btc-classic.org:63101 \
     --user cc1q....your_btcc_address.m2-laptop \
     --pass x \
+    --suggest-difficulty 16 \
     --gpu --gpu-binary src/metal_nonce_finder
 ```
 
@@ -86,10 +94,12 @@ python3 src/stratum_miner.py \
 [stratum] connecting to pool.btc-classic.org:63101 as 'cc1q....m2-test' ...
 [metal] device="Apple M2" gpu_cores=10 threadExecutionWidth=32 maxTPT=576 threadgroup=576 per_dispatch=20971520 (20.0M) [auto]
 [stratum] subscribed: extranonce1=000001b4 extranonce2_size=4
+[stratum] auto suggest_difficulty=16 (Apple M2)
+[stratum] suggest_difficulty accepted by pool: 16
 [stratum] set_difficulty=2.0
 [stratum] new job 0000000e prev=...
 [stratum] authorized as 'cc1q....m2-test'
-[stratum] mining ~178.5 MH/s  diff=2.0  shares=0
+[stratum] mining ~178.5 MH/s  diff=2.0  avg_share=48s  shares=0
 [stratum] SHARE ACCEPTED  job=0000000e nonce=fdb4fd65 hash=00000000303a9fb3...
 ```
 
@@ -133,6 +143,7 @@ python3 src/gbt_miner.py \
 | `--gpu-target-seconds` | stratum `1.0` / solo `2.0` | 越小切换 job 越快，越大开销摊得越薄 |
 | `--gpu-per-dispatch` | `0` | 按 IOKit 读到的 GPU 核数缩放（≈ `cores × 2 M`，clamp 到 4 M~64 M） |
 | `--gpu-threadgroup` | `0` | 用 Metal pipeline 自报的 `maxTotalThreadsPerThreadgroup`（M2 上 SHA-256d 内核 = 576） |
+| `--suggest-difficulty` | `-1` | Stratum share difficulty 建议值；`-1` 按芯片自动建议，`0` 关闭建议，正数手动指定 |
 
 启动时 stderr 会打印一行实际选用的值，方便确认：
 
@@ -147,6 +158,41 @@ job 切换更灵敏：
 ```bash
 ./scripts/start_stratum.sh cc1q....  --gpu-target-seconds 0.3
 ```
+
+### Share difficulty 建议
+
+矿池最终下发的 `mining.set_difficulty` 才是实际 share 难度；本参数只是通过
+`mining.suggest_difficulty` 向矿池提出建议，矿池可以接受、忽略或按自己的最小值钳制。
+默认 BTCC 公矿池当前最低 share difficulty 是 `16`，所以自动建议不会低于 `16`。
+
+默认不传 `--suggest-difficulty` 时，矿工会根据 `sysctl machdep.cpu.brand_string`
+识别到的芯片型号自动建议：
+
+| 芯片 | 自动建议 |
+|---|---:|
+| CPU fallback | `16` |
+| M1 | `16` |
+| M2 / M3 / M4 base | `16` |
+| M Pro | `32` |
+| M Max | `64` |
+| M Ultra | `128` |
+
+想手动覆盖：
+
+```bash
+./scripts/start_stratum.sh cc1q.... --suggest-difficulty 16
+```
+
+想完全使用矿池默认值：
+
+```bash
+./scripts/start_stratum.sh cc1q.... --suggest-difficulty 0
+```
+
+降低 share difficulty 会让本地更快出现 `SHARE ACCEPTED`、矿池后台更快看到矿工在线，
+但不会提高实际收益。矿池会按 share difficulty 给 share 计权，例如 1 个 diff=16 的
+share 约等于 16 个 diff=1 的 share。状态日志里的 `avg_share=...` 会按当前算力和
+矿池实际下发的 difficulty 估算平均多久出一个 share。
 
 ## 连接故障排查
 
@@ -372,6 +418,30 @@ apple-gpu-miner/
 代码从 [Bitcoin-Classic](https://github.com/bitcoin-classic/bitcoin-classic) 仓库中的 macOS GPU 挖矿组件抽取并通用化而来。Metal 内核的"midstate + 只跑 tail 第二次 compress"结构是十几年来 cgminer / bfgminer / cpuminer 一直在用的成熟模式。
 
 ## 更新日志
+
+### 2026-06-14 — Stratum share difficulty 自动建议
+
+这次更新补了 Stratum 的 share difficulty 建议逻辑，并把相关运行信息和文档一起补齐。
+
+新增 / 改动：
+
+- **`--suggest-difficulty` 参数**：`stratum_miner.py` 现在支持手动指定 share difficulty 建议值。
+  传正数会主动向矿池发送 `mining.suggest_difficulty`；传 `0` 则关闭建议，完全接受矿池默认。
+- **按芯片自动建议**：如果不传 `--suggest-difficulty`，矿工会根据 `sysctl machdep.cpu.brand_string`
+  自动判断 Apple 芯片型号，并给出保守的建议值。默认 BTCC 公矿池当前最低 share difficulty 是 `16`，
+  所以自动建议不会低于 `16`。当前映射是：
+  - M1：`16`
+  - M2 / M3 / M4 base：`16`
+  - M Pro：`32`
+  - M Max：`64`
+  - M Ultra：`128`
+  - CPU fallback：`16`
+- **Stratum 会话日志增强**：状态行现在会显示 `avg_share=...`，用于估算当前算力和实际 share difficulty
+  下平均多久能出一个 share；找到候选 share 时也会先打印完整的提交参数，方便排查 submit 问题。
+- **nonce 提交字节序修正**：`mining.submit` 现在提交的是 header 中 nonce 的 4 个原始字节，而不是整数格式化后的
+  大端字符串，避免池端把 share 误判为无效。
+- **README 更新**：中文和英文文档都补了 `--suggest-difficulty` 的用法、默认行为和示例，并明确说明降低 share
+  difficulty 只会让 `SHARE ACCEPTED` 更快出现，不会提高真实收益。
 
 ### 2026-06-12 — 释放全部 GPU 性能 / M 系列零调参
 

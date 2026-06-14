@@ -17,7 +17,8 @@ private testnets, …).
   Metal pipeline's `maxTotalThreadsPerThreadgroup`; per-dispatch is sized
   from the core count; the Python driver adapts batch size to the observed
   hashrate. M1 / M2 / M3 / M4 base / Pro / Max / Ultra all "just work" with
-  no chip-model parameter.
+  no chip-model parameter. In Stratum mode the miner also auto-suggests a
+  suitable share difficulty based on the detected Apple chip.
 - **Persistent GPU helper.** `metal_nonce_finder --persistent` reads JSON
   jobs from stdin so the Metal shader is compiled exactly once per mining
   session instead of per batch (~0.5 s saved every batch). Two command
@@ -77,6 +78,12 @@ starting with `--` is forwarded to `stratum_miner.py` verbatim.
 # Forward extra GPU/network flags
 ./scripts/start_stratum.sh cc1q....  --gpu-target-seconds 0.3
 
+# Manually suggest share difficulty; omitted = auto by chip
+./scripts/start_stratum.sh cc1q....  --suggest-difficulty 16
+
+# Disable difficulty suggestion and accept the pool default
+./scripts/start_stratum.sh cc1q....  --suggest-difficulty 0
+
 # Or use the env var
 POOL_URL=stratum+tcp://your.pool:3333 ./scripts/start_stratum.sh cc1q....
 ```
@@ -88,6 +95,7 @@ python3 src/stratum_miner.py \
     --url  stratum+tcp://pool.btc-classic.org:63101 \
     --user cc1q....your_btcc_address.m2-laptop \
     --pass x \
+    --suggest-difficulty 16 \
     --gpu --gpu-binary src/metal_nonce_finder
 ```
 
@@ -97,10 +105,12 @@ python3 src/stratum_miner.py \
 [stratum] connecting to pool.btc-classic.org:63101 as 'cc1q....m2-test' ...
 [metal] device="Apple M2" gpu_cores=10 threadExecutionWidth=32 maxTPT=576 threadgroup=576 per_dispatch=20971520 (20.0M) [auto]
 [stratum] subscribed: extranonce1=000001b4 extranonce2_size=4
+[stratum] auto suggest_difficulty=16 (Apple M2)
+[stratum] suggest_difficulty accepted by pool: 16
 [stratum] set_difficulty=2.0
 [stratum] new job 0000000e prev=...
 [stratum] authorized as 'cc1q....m2-test'
-[stratum] mining ~178.5 MH/s  diff=2.0  shares=0
+[stratum] mining ~178.5 MH/s  diff=2.0  avg_share=48s  shares=0
 [stratum] SHARE ACCEPTED  job=0000000e nonce=fdb4fd65 hash=00000000303a9fb3...
 ```
 
@@ -143,6 +153,7 @@ All GPU knobs default to `0` (auto). Both miners share the same flags:
 | `--gpu-target-seconds` | `1.0` (pool) / `2.0` (solo) | Smaller = faster job-switch latency; larger = lower per-batch overhead. |
 | `--gpu-per-dispatch` | `0` | Scales with detected GPU core count (≈ cores × 2 M, clamped to 4 M-64 M). |
 | `--gpu-threadgroup` | `0` | Uses the pipeline's `maxTotalThreadsPerThreadgroup` (576 for the SHA-256d kernel on M2). |
+| `--suggest-difficulty` | `-1` | Stratum share difficulty suggestion; `-1` auto-picks by chip, `0` disables the suggestion, positive values pin it. |
 
 The Metal helper logs its choices on stderr at startup, e.g.:
 
@@ -152,6 +163,44 @@ The Metal helper logs its choices on stderr at startup, e.g.:
 ```
 
 Pass any flag a positive integer to pin it; pass `0` to go back to auto.
+
+### Share Difficulty Suggestion
+
+The pool's `mining.set_difficulty` notification is authoritative. This option
+only sends a `mining.suggest_difficulty` request; the pool may accept it, ignore
+it, or clamp it to a pool-defined minimum.
+The default BTCC public pool currently has a minimum share difficulty of `16`,
+so the automatic suggestion does not go below `16`.
+
+When `--suggest-difficulty` is omitted, the miner reads
+`sysctl machdep.cpu.brand_string` and suggests:
+
+| Chip | Auto suggestion |
+|---|---:|
+| CPU fallback | `16` |
+| M1 | `16` |
+| M2 / M3 / M4 base | `16` |
+| M Pro | `32` |
+| M Max | `64` |
+| M Ultra | `128` |
+
+Manual override:
+
+```bash
+./scripts/start_stratum.sh cc1q.... --suggest-difficulty 16
+```
+
+Use the pool default:
+
+```bash
+./scripts/start_stratum.sh cc1q.... --suggest-difficulty 0
+```
+
+Lower share difficulty makes `SHARE ACCEPTED` and pool dashboard updates appear
+sooner, but it does not increase real payout. Pools weight shares by difficulty;
+for example, one diff-16 share is roughly equivalent to sixteen diff-1 shares.
+The status line's `avg_share=...` estimate uses the actual difficulty most
+recently sent by the pool.
 
 ## How it works
 

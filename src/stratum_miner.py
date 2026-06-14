@@ -31,6 +31,7 @@ import queue
 import random
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -52,6 +53,76 @@ def diff_to_target_int(diff: float) -> int:
     if diff <= 0:
         return (1 << 256) - 1
     return int(DIFF1_TARGET / diff)
+
+
+def expected_share_seconds(diff: float, hashrate: float) -> Optional[float]:
+    """Expected mean time to one pool share at the current share difficulty."""
+    if diff <= 0 or hashrate <= 0:
+        return None
+    return (diff * 4294967296.0) / hashrate
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "?"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+def submit_nonce_hex(nonce: int) -> str:
+    """Stratum submits the 4 nonce bytes exactly as they appear in the header."""
+    return struct.pack("<I", nonce & 0xFFFFFFFF).hex()
+
+
+def _sysctl_value(name: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["sysctl", "-n", name],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def detect_apple_chip_name() -> str:
+    """Return a best-effort Apple chip label such as 'Apple M2 Pro'."""
+    brand = _sysctl_value("machdep.cpu.brand_string")
+    if brand:
+        return brand
+    model = _sysctl_value("hw.model")
+    return model or "unknown"
+
+
+def auto_suggest_difficulty(*, use_gpu: bool) -> tuple[float, str]:
+    """Pick a conservative Stratum share difficulty for this Mac.
+
+    Lower share difficulty makes the pool dashboard update sooner, but share
+    weights remain proportional to difficulty. The pool may ignore or clamp
+    this suggestion; mining.set_difficulty is authoritative.
+    """
+    if not use_gpu:
+        return 16.0, "cpu"
+
+    chip = detect_apple_chip_name()
+    chip_l = chip.lower()
+    if "ultra" in chip_l:
+        return 128.0, chip
+    if "max" in chip_l:
+        return 64.0, chip
+    if "pro" in chip_l:
+        return 32.0, chip
+    if "m1" in chip_l:
+        return 16.0, chip
+    if "m2" in chip_l or "m3" in chip_l or "m4" in chip_l or "m5" in chip_l:
+        return 16.0, chip
+    return 16.0, chip
 
 
 def stratum_prevhash_to_le32(prev_hex: str) -> bytes:
@@ -426,6 +497,33 @@ def mine_session(args: argparse.Namespace, host: str, port: int,
         client.close()
         return "subscribe_parse_failed"
 
+    suggest_diff = float(args.suggest_difficulty)
+    if suggest_diff < 0:
+        auto_diff, reason = auto_suggest_difficulty(use_gpu=bool(args.gpu))
+        suggest_diff = auto_diff
+        print(
+            f"[stratum] auto suggest_difficulty={suggest_diff:g} ({reason})",
+            flush=True,
+        )
+    elif suggest_diff == 0:
+        print("[stratum] suggest_difficulty disabled; using pool default", flush=True)
+    if suggest_diff > 0:
+        sd_status, sd_result = client.call(
+            "mining.suggest_difficulty",
+            [suggest_diff],
+            timeout=10,
+        )
+        if sd_status == "ok" and sd_result:
+            print(
+                f"[stratum] suggest_difficulty accepted by pool: {suggest_diff:g}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[stratum] suggest_difficulty not accepted: {sd_result}",
+                flush=True,
+            )
+
     # 2. authorize
     auth_status, auth_result = client.call("mining.authorize", [args.user, args.pass_])
     if auth_status != "ok" or not auth_result:
@@ -511,9 +609,11 @@ def mine_session(args: argparse.Namespace, host: str, port: int,
         if now_t - last_status >= 5.0:
             elapsed = now_t - started_at
             hps = res.get("hashrate", 0)
+            avg_share = format_duration(expected_share_seconds(float(diff), float(hps)))
             print(
                 f"[stratum] mining ~{hps/1e6:.1f} MH/s  diff={diff}  "
-                f"shares={total_shares_found}  uptime={int(elapsed)}s  "
+                f"avg_share={avg_share}  shares={total_shares_found}  "
+                f"uptime={int(elapsed)}s  "
                 f"job={job.job_id} ex2={ex2.hex()}",
                 flush=True,
             )
@@ -541,9 +641,17 @@ def mine_session(args: argparse.Namespace, host: str, port: int,
         total_shares_found += 1
         # Build submit parameters.
         # mining.submit: [worker_name, job_id, extranonce2_hex, ntime_hex, nonce_hex]
-        # Both ntime and nonce go on the wire as 8 hex chars in big-endian order.
+        # ntime is submitted in Stratum's display order. nonce is submitted
+        # as the 4 serialized header bytes (little-endian uint32).
         ntime_hex = "%08x" % local_ntime
-        nonce_hex = "%08x" % nonce
+        nonce_hex = submit_nonce_hex(nonce)
+        print(
+            f"[stratum] share candidate  job={job.job_id} diff={diff} "
+            f"ex2={ex2.hex()} ntime={ntime_hex} nonce={nonce_hex} "
+            f"nonce_int={nonce} "
+            f"hash={h_be.hex()} target={target_be.hex()}",
+            flush=True,
+        )
         submit_status, submit_result = client.call(
             "mining.submit",
             [args.user, job.job_id, ex2.hex(), ntime_hex, nonce_hex],
@@ -674,6 +782,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Per-address TCP connect timeout in seconds. "
                         "Lower this if your IPv6 path is broken; the miner "
                         "will fall back to IPv4 sooner.")
+    p.add_argument("--suggest-difficulty", type=float, default=-1.0,
+                   help="Suggested Stratum share difficulty. Default -1 auto-picks "
+                        "from the detected Apple chip (M1/base M2/M3/M4=16, "
+                        "Pro=32, Max=64, Ultra=128). Use 0 to disable and accept "
+                        "the pool default.")
 
     default_gpu_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metal_nonce_finder")
     p.add_argument("--gpu", action="store_true",
